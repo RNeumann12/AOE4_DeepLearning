@@ -30,10 +30,10 @@ SLEEP_BETWEEN_REQUESTS = 5.6
 MAX_LEADERBOARD_PAGES = 30
 
 min_rating = 1700
-num_players_to_collect = 100
+num_players_to_collect = 200
 games_per_player = 20
 
-OUTFILE = "collected_games_with_summary_v2.jsonl"
+OUTFILE = f"collected_games_with_summary_v2_{time.strftime('%Y-%m-%d')}.jsonl"
 
 HEADERS = {
     "User-Agent": "aoe4-data-collector/1.0 (+https://example.com)"
@@ -271,7 +271,9 @@ def main():
     with open(OUTFILE, "w", encoding="utf-8") as f_out:
         for p in players:
             pid = p["profile_id"]
-            games = fetch_player_games(pid, limit=games_per_player)
+            raw_games = fetch_player_games(pid, limit=games_per_player)
+            games = [g for g in raw_games if isinstance(g, dict) and g.get("kind") == "rm_1v1"]
+
             if not games:
                 print(f"[INFO] No games returned for player {pid}; skipping.")
                 continue
