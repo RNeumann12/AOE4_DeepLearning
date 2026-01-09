@@ -8,13 +8,24 @@ import pandas as pd
 import seaborn as sns
 import matplotlib.pyplot as plt
 
-from rich.table import Table
-from rich.console import Console
+import csv
+import math
 from collections import defaultdict
 from typing import Dict
 
 
 def process_file(path: str, stats: Dict[str, Dict[str, int]], h2h) -> None:
+    """
+    Process a single file containing a .jsonl of game records.
+
+    Skips games shorter than 2 minutes (120s) when duration is available.
+
+    Updates per-civilization stats (games, wins) and head-to-head stats (games, wins) for each game.
+
+    :param path: Path to a .jsonl file containing game records.
+    :param stats: A dictionary of per-civilization stats to update.
+    :param h2h: A dictionary of head-to-head stats to update.
+    """
     with open(path, "r", encoding="utf-8") as fh:
         for lineno, line in enumerate(fh, 1):
             line = line.strip()
@@ -84,6 +95,15 @@ def process_file(path: str, stats: Dict[str, Dict[str, int]], h2h) -> None:
                         h2h[l][w]["games"] += 1
 
 def h2h_to_dataframe(h2h):
+    """
+    Convert a head-to-head dictionary to a pandas DataFrame.
+
+    The DataFrame contains the winrates of each civilization against others.
+    The index and columns of the DataFrame are the civilization names.
+
+    :param h2h: A dictionary of head-to-head game records.
+    :return: A pandas DataFrame of winrates between civilizations.
+    """
     if pd is None:
         raise RuntimeError("pandas is required for DataFrame export")
     civs = sorted(h2h.keys())
@@ -96,30 +116,19 @@ def h2h_to_dataframe(h2h):
         mat.append(row)
     return pd.DataFrame(mat, index=civs, columns=civs)
 
-
-def print_h2h_rich(h2h, max_cols=15):
-    if Console is None:
-        print("[INFO] install 'rich' for nicer console tables (pip install rich)")
-        return
-    console = Console()
-    civs = sorted(h2h.keys(), key=lambda c: -sum(v["games"] for v in h2h[c].values()))[:max_cols]
-    table = Table(show_header=True, header_style="bold magenta")
-    table.add_column("Civ")
-    for c in civs:
-        table.add_column(c, justify="center")
-    for r in civs:
-        row = [r]
-        for c in civs:
-            rec = h2h.get(r, {}).get(c, {"wins": 0, "games": 0})
-            if rec["games"]:
-                row.append(f"{rec['wins']}/{rec['games']} {rec['wins']/rec['games']*100:4.1f}%")
-            else:
-                row.append("-")
-        table.add_row(*row)
-    console.print(table)
-
-
 def save_h2h_heatmap(h2h, out_png="h2h_heatmap.png"):
+    """
+    Save a heatmap of the head-to-head winrates between civilizations.
+
+    The heatmap is a square matrix where each cell (row, column) represents the winrate of the row civilization against the column civilization.
+    The winrates are centered around 0.5 (50% winrate) and color-coded with a colormap.
+    The heatmap is annotated with the winrate values in each cell.
+
+    The heatmap is saved to a PNG file with a specified filename.
+
+    :param h2h: A dictionary of head-to-head game records.
+    :param out_png: The filename of the output PNG file (default: "h2h_heatmap.png").
+    """
     if pd is None or sns is None:
         print("[INFO] install pandas and seaborn to save heatmap (pip install pandas seaborn matplotlib)")
         return
@@ -296,7 +305,7 @@ def extract_events_from_obj(obj: dict):
         if player_civ is not None:
             player_civ = str(player_civ).lower()
 
-        # determine enemy civ(s): all unique civs of players not on this player's team
+        # determine enemy civ: all unique civs of players not on this player's team
         enemy_civs = set()
         for pid, civ in profile_to_civ.items():
             if pid == profile_id:
@@ -359,7 +368,7 @@ def extract_events_from_obj(obj: dict):
 def prepare_transformer_csv(files, out_csv: str) -> None:
     """Extract events from given file(s) and write a CSV suitable for transformer training.
 
-    Output columns: game_id, profile_id, event, entity, time, delta_time (s), delta_time_scaled (log1p), phase, player_civ, enemy_civ
+    Output columns: game_id, profile_id, event, entity, time, delta_time (s), delta_time_scaled (log1p), phase, player_civ, player_result, player_won, enemy_civ
     """
     if isinstance(files, str):
         files = [files]
@@ -405,9 +414,6 @@ def prepare_transformer_csv(files, out_csv: str) -> None:
     for e in all_events:
         key = (e.get('game_id'), e.get('profile_id'))
         groups[key].append(e)
-
-    import csv
-    import math
 
     with open(out_csv, 'w', newline='', encoding='utf-8') as out:
         writer = csv.DictWriter(out, fieldnames=['game_id', 'profile_id', 'event', 'entity', 'time', 'delta_time', 'delta_time_scaled', 'phase', 'player_civ', 'player_result', 'player_won', 'enemy_civ'])
@@ -530,8 +536,7 @@ def main():
             wr = wins / games * 100 if games else 0.0
             print(f"  {opp}: {wr:.1f}% ({wins}/{games})")
 
-    # print full matrix
-    print_h2h_rich(h2h)
+    # save full matrix
     if args.winrate_heatmap:
         save_h2h_heatmap(h2h, out_png=args.winrate_heatmap)
     if args.games_heatmap:
