@@ -18,8 +18,8 @@ from tqdm import tqdm
 
 import wandb
 
-from data_transformer import build_vocabs, AoEEventDataset, collate_fn
-from model import AoETransformer
+from aoe_player_game_datset import build_vocabs, AoEEventDataset, collate_fn
+from WinRatePrediction.WinRateTransformerModel import AoETransformer
 
 
 def set_seed(seed: int = 42):
@@ -161,7 +161,10 @@ def main(args):
         pct_start=0.3  # Warm up for first 30% of training
     )
 
+    patience = 5
+    no_improve = 0
     best_val_auc = -1
+    
     for epoch in range(1, epochs + 1):
         model.train()
         pbar = tqdm(train_loader, desc=f'Epoch {epoch}', leave=False)
@@ -218,6 +221,18 @@ def main(args):
             pbar.set_postfix(loss=np.mean(epoch_losses))
 
         val_loss, val_auc, val_acc = evaluate(model, val_loader, device)
+        if val_auc > best_val_auc + 1e-6:
+            best_val_auc = val_auc
+            no_improve = 0
+            out_path = args.output or 'best_model.pt'
+
+            torch.save({'model_state': model.state_dict(), 'vocabs': vocabs}, out_path)
+         # keep best model
+        else:
+            no_improve += 1
+            if no_improve >= patience:
+                print("Early stopping (no improvement).")
+                break
         print(f'Epoch {epoch}: train_loss={np.mean(epoch_losses):.4f} val_loss={val_loss:.4f} val_auc={val_auc:.4f} val_acc={val_acc:.4f}')
 
         if run is not None:
