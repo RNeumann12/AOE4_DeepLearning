@@ -241,17 +241,49 @@ def _game_duration_seconds(obj: dict) -> int | None:
             pass
     return None
 
+def _build_resource_snapshots(player: dict):
+    """
+    Returns a dict: profile_id -> list of snapshots sorted by time
+    Each snapshot: {'time': t, 'wood': x, 'food': y, 'gold': z, 'stone': w, ...}
+    """
+    res_data = player.get('resources') or {}
+    times = res_data.get('timestamps') or []
+    if not times:
+        return {}
+
+    snapshots = {}
+    for i, t in enumerate(times):
+        snapshot = {}
+        for key in ['wood', 'food', 'gold', 'stone', 'wood_per_min', 'food_per_min', 'gold_per_min', 'stone_per_min']:
+            vals = res_data.get(key) or []
+            snapshot[key] = vals[i] if i < len(vals) else 0
+        snapshots[t] = snapshot
+    
+    return snapshots
+
+
+def _get_snapshot_for_time(snapshots, evt_time):
+    # timestamps sorted once
+    eligible_times = [t for t in snapshots.keys() if t <= evt_time]
+    if not eligible_times:
+        return {}  # no snapshot available
+    latest_time = max(eligible_times)
+    return snapshots[latest_time]
+
 
 def extract_events_from_obj(obj: dict):
     """Return a list of event dicts extracted from a single game record JSON object.
 
-    Each event: {game_id, profile_id, time (s), event (BUILD/FINISH/DESTROY/UNKNOWN), entity, player_civ, enemy_civ}
+    Each event: {game_id, profile_id, time (s), event (BUILD/FINISH/DESTROY/UNKNOWN), entity, map, player_civ, enemy_civ}
     """
     evs = []
     # try to find summary.players[] first (preferred)
     summary = obj.get('summary') or {}
     game_id = summary.get('game_id') or (obj.get('game') or {}).get('game_id')
     players = summary.get('players') or []
+    game_map = summary.get('map_name') or (obj.get('game') or {}).get('map')
+
+
     # fallback: try to find players under top-level game entry
     if not players and 'game' in obj:
         teams = obj['game'].get('teams') or obj['game'].get('players') or []
@@ -325,15 +357,21 @@ def extract_events_from_obj(obj: dict):
         build_order = player.get('build_order') or player.get('buildOrder') or []
         if not isinstance(build_order, list):
             continue
+
+        resource_snapshot = _build_resource_snapshots(player)
+       
         for item in build_order:
             icon = item.get('icon') or ''
             entity = _clean_entity_from_icon(icon)
+
             # types to map => event name
             for key, name in (('constructed', 'BUILD'), ('finished', 'FINISH'), ('destroyed', 'DESTROY')):
                 times = item.get(key) or []
                 if isinstance(times, list):
                     for t in times:
-                        evs.append({
+                        cur_snapshot = _get_snapshot_for_time(resource_snapshot, int(t))
+
+                        e = {
                             'game_id': game_id,
                             'profile_id': profile_id,
                             'time': int(t) if t is not None else 0,
@@ -343,14 +381,42 @@ def extract_events_from_obj(obj: dict):
                             'player_result': profile_to_result.get(profile_id, ''),
                             'player_won': 1 if profile_to_won.get(profile_id) else 0,
                             'enemy_civ': enemy_civs_joined,
-                        })
+                            'map': game_map,
+                        }
+
+                        res = {
+                            'wood': cur_snapshot['wood'],
+                            'stone': cur_snapshot['stone'],
+                            'food': cur_snapshot['food'],
+                            'gold': cur_snapshot['gold'],
+                            'food_per_min': cur_snapshot['food_per_min'],
+                            'gold_per_min': cur_snapshot['gold_per_min'],
+                            'stone_per_min': cur_snapshot['stone_per_min'],
+                            'wood_per_min': cur_snapshot['wood_per_min'],
+                            # 'oliveoil': cur_snapshot['oliveoil'],
+                            # 'oliveoil_per_min': cur_snapshot['oliveoil_per_min'],
+                            # 'food_gathered': cur_snapshot['food_gathered'],
+                            # 'gold_gathered': cur_snapshot['gold_gathered'],
+                            # 'stone_gathered': cur_snapshot['stone_gathered'],
+                            # 'wood_gathered': cur_snapshot['wood_gathered'],
+                            # 'oliveoil_gathered': cur_snapshot['oliveoil_gathered'],
+                            # 'military': cur_snapshot['military'],
+                            # 'economy': cur_snapshot['economy'],
+                            # 'technology': cur_snapshot['technology'],
+                            # 'society': cur_snapshot['society']
+                        }
+
+                        evs.append(e | res)
+
             # unknown may be a dict of lists
             unknown = item.get('unknown') or {}
             if isinstance(unknown, dict):
                 for val in unknown.values():
                     if isinstance(val, list):
                         for t in val:
-                            evs.append({
+                            cur_snapshot = _get_snapshot_for_time(resource_snapshot, int(t))
+
+                            e = {
                                 'game_id': game_id,
                                 'profile_id': profile_id,
                                 'time': int(t) if t is not None else 0,
@@ -360,7 +426,31 @@ def extract_events_from_obj(obj: dict):
                                 'player_result': profile_to_result.get(profile_id, ''),
                                 'player_won': 1 if profile_to_won.get(profile_id) else 0,
                                 'enemy_civ': enemy_civs_joined,
-                            })
+                                'map': game_map,
+                            }
+
+                            res = {
+                                'wood': cur_snapshot['wood'],
+                                'stone': cur_snapshot['stone'],
+                                'food': cur_snapshot['food'],
+                                'gold': cur_snapshot['gold'],
+                                'food_per_min': cur_snapshot['food_per_min'],
+                                'gold_per_min': cur_snapshot['gold_per_min'],
+                                'stone_per_min': cur_snapshot['stone_per_min'],
+                                'wood_per_min': cur_snapshot['wood_per_min'],
+                                # 'oliveoil': cur_snapshot['oliveoil'],
+                                # 'oliveoil_per_min': cur_snapshot['oliveoil_per_min'],
+                                # 'food_gathered': cur_snapshot['food_gathered'],
+                                # 'gold_gathered': cur_snapshot['gold_gathered'],
+                                # 'stone_gathered': cur_snapshot['stone_gathered'],
+                                # 'wood_gathered': cur_snapshot['wood_gathered'],
+                                # 'oliveoil_gathered': cur_snapshot['oliveoil_gathered'],
+                                # 'military': cur_snapshot['military'],
+                                # 'economy': cur_snapshot['economy'],
+                                # 'technology': cur_snapshot['technology'],
+                                # 'society': cur_snapshot['society']
+                            }
+                            evs.append(e | res)
 
     return evs
 
@@ -416,7 +506,7 @@ def prepare_transformer_csv(files, out_csv: str) -> None:
         groups[key].append(e)
 
     with open(out_csv, 'w', newline='', encoding='utf-8') as out:
-        writer = csv.DictWriter(out, fieldnames=['game_id', 'profile_id', 'event', 'entity', 'time', 'delta_time', 'delta_time_scaled', 'phase', 'player_civ', 'player_result', 'player_won', 'enemy_civ'])
+        writer = csv.DictWriter(out, fieldnames=['game_id', 'profile_id', 'event', 'entity', 'time', 'delta_time', 'delta_time_scaled', 'phase', 'player_civ', 'player_result', 'player_won', 'enemy_civ', 'map', 'wood', 'wood_per_min', 'stone', 'stone_per_min', 'food', 'food_per_min', 'gold', 'gold_per_min'])
         writer.writeheader()
         for key, evs in groups.items():
             evs_sorted = sorted(evs, key=lambda x: x.get('time', 0))
@@ -443,6 +533,26 @@ def prepare_transformer_csv(files, out_csv: str) -> None:
                     'player_result': ev.get('player_result'),
                     'player_won': ev.get('player_won'),
                     'enemy_civ': ev.get('enemy_civ'),
+                    'map': ev.get('map'),
+                    'wood': ev.get('wood'),
+                    'stone': ev.get('stone'),
+                    'food': ev.get('food'),
+                    'gold': ev.get('gold'),
+                    'food_per_min': ev.get('food_per_min'),
+                    'gold_per_min': ev.get('gold_per_min'),
+                    'stone_per_min': ev.get('stone_per_min'),
+                    'wood_per_min': ev.get('wood_per_min'),
+                    # 'oliveoil': ev.get('oliveoil'),
+                    # 'oliveoil_per_min': ev.get('oliveoil_per_min'),
+                    # 'food_gathered': ev.get('food_gathered'),
+                    # 'gold_gathered': ev.get('gold_gathered'),
+                    # 'stone_gathered': ev.get('stone_gathered'),
+                    # 'wood_gathered': ev.get('wood_gathered'),
+                    # 'oliveoil_gathered': ev.get('oliveoil_gathered'),
+                    # 'military': ev.get('military'),
+                    # 'economy': ev.get('economy'),
+                    # 'technology': ev.get('technology'),
+                    # 'society': ev.get('society')
                 })
     print(f"[INFO] Events CSV written to {out_csv}")
 
@@ -456,7 +566,7 @@ def main():
                    help="Write games-count heatmap PNG (default: h2h_games_heatmap.png). Use empty string to skip.")
     p.add_argument("--min-games", dest="min_games", type=int, default=10,
                    help="Minimum games threshold to highlight cells in games heatmap (default: 10).")
-    p.add_argument("--export-events", dest="export_events", default="transformer_input.csv",
+    p.add_argument("--export-events", dest="export_events", default="transformer_input_test.csv",
                    help="Write transformer-ready events CSV to given path (e.g. events.csv). If empty, no events file is written.")
     args = p.parse_args()
 

@@ -29,7 +29,7 @@ def build_vocabs(df: pd.DataFrame, min_freq: int = 1) -> Dict[str, Dict[str, int
 
     The vocabularies are built by counting the frequency of each token in the columns.
     Tokens with a frequency below the given min_freq are not included in the vocabularies.
-    The vocabularies are returned as a dictionary with keys 'entity_vocab', 'event_vocab', and 'civ_vocab'.
+    The vocabularies are returned as a dictionary with keys 'entity_vocab', 'event_vocab', 'civ_vocab', and 'map_vocab'.
     Each vocabulary is a dictionary mapping tokens to their indices.
 
     :param df: A DataFrame containing the columns 'entity', 'event', 'player_civ', and 'enemy_civ'.
@@ -39,6 +39,11 @@ def build_vocabs(df: pd.DataFrame, min_freq: int = 1) -> Dict[str, Dict[str, int
     entity_counts = Counter(df['entity'].astype(str).tolist())
     event_counts = Counter(df['event'].astype(str).tolist())
     civ_counts = Counter(df['player_civ'].astype(str).tolist() + df['enemy_civ'].astype(str).tolist())
+    # map column may be absent in older/alternate CSVs; handle gracefully
+    if 'map' in df.columns:
+        map_counts = Counter(df['map'].astype(str).fillna(UNK_TOKEN).tolist())
+    else:
+        map_counts = Counter()
 
     def make_vocab(counter: Counter) -> Dict[str, int]:
         vocab = {PAD_TOKEN: 0, UNK_TOKEN: 1}
@@ -50,7 +55,8 @@ def build_vocabs(df: pd.DataFrame, min_freq: int = 1) -> Dict[str, Dict[str, int
     return {
         'entity_vocab': make_vocab(entity_counts),
         'event_vocab': make_vocab(event_counts),
-        'civ_vocab': make_vocab(civ_counts)
+        'civ_vocab': make_vocab(civ_counts),
+        'map_vocab': make_vocab(map_counts),
     }
 
 
@@ -63,7 +69,7 @@ class AoEEventDataset(Dataset):
     Each item corresponds to a single player's event sequence in a game, with label in `player_won`.
     """
 
-    def __init__(self, csv_path: str, entity_vocab: Dict[str, int], event_vocab: Dict[str, int], civ_vocab: Dict[str, int], max_len: Optional[int] = None, use_time_features: bool = True, truncation_strategy: str = 'head_tail'):
+    def __init__(self, csv_path: str, entity_vocab: Dict[str, int], event_vocab: Dict[str, int], civ_vocab: Dict[str, int], map_vocab: Dict[str, int], max_len: Optional[int] = None, use_time_features: bool = True, truncation_strategy: str = 'head_tail'):
         """
         Initialize the dataset from a CSV file containing event sequences per player-game.
 
@@ -71,6 +77,7 @@ class AoEEventDataset(Dataset):
         :param entity_vocab: Vocabulary for "entity" tokens.
         :param event_vocab: Vocabulary for "event" tokens.
         :param civ_vocab: Vocabulary for "civ" tokens.
+        :param map_vocab: Vocabulary for "map" tokens.
         :param max_len: Maximum length of a sequence. If None, do not truncate and use all events.
                         If set, sequences longer than `max_len` will be truncated according to
                         `truncation_strategy`.
@@ -83,6 +90,7 @@ class AoEEventDataset(Dataset):
         self.entity_vocab = entity_vocab
         self.event_vocab = event_vocab
         self.civ_vocab = civ_vocab
+        self.map_vocab = map_vocab
         self.use_time_features = use_time_features
         self.truncation_strategy = truncation_strategy
 
@@ -98,6 +106,26 @@ class AoEEventDataset(Dataset):
             rows_sorted = sorted(rows, key=lambda r: r['time'])
             entities = [str(r['entity']) for r in rows_sorted]
             events = [str(r['event']) for r in rows_sorted]
+            # Optional resource columns - fill with 0 if missing
+            if 'wood' in self.df.columns:
+                wood = [r['wood'] for r in rows_sorted]
+            else:
+                wood = [0 for _ in rows_sorted]
+
+            if 'food' in self.df.columns:
+                food = [r['food'] for r in rows_sorted]
+            else:
+                food = [0 for _ in rows_sorted]
+
+            if 'stone' in self.df.columns:
+                stone = [r['stone'] for r in rows_sorted]
+            else:
+                stone = [0 for _ in rows_sorted]
+
+            if 'gold' in self.df.columns:
+                gold = [r['gold'] for r in rows_sorted]
+            else:
+                gold = [0 for _ in rows_sorted] 
             # prefer delta_time_scaled if present and numeric, otherwise fall back to `time`
             times = []
             for r in rows_sorted:
@@ -118,8 +146,14 @@ class AoEEventDataset(Dataset):
 
             # player metadata from first row
             label = int(rows_sorted[0]['player_won'])
-            player_civ = rows_sorted[0]['player_civ']
-            enemy_civ = rows_sorted[0]['enemy_civ']
+            player_civ = rows_sorted[0].get('player_civ')
+            enemy_civ = rows_sorted[0].get('enemy_civ')
+            # Some CSVs may not have a 'map' field or it may be NaN/None; normalize to UNK_TOKEN string
+            raw_map = rows_sorted[0].get('map') if 'map' in rows_sorted[0].index else None
+            if raw_map is None or (isinstance(raw_map, float) and pd.isna(raw_map)):
+                game_map = UNK_TOKEN
+            else:
+                game_map = str(raw_map)
             game_id = rows_sorted[0]['game_id']
 
             self.examples.append({
@@ -127,6 +161,11 @@ class AoEEventDataset(Dataset):
                 'entities': entities,
                 'events': events,
                 'times': times,
+                'wood': wood,
+                'food': food,
+                'gold': gold,
+                'stone': stone,
+                'map': game_map,
                 'player_civ': player_civ,
                 'enemy_civ': enemy_civ,
                 'label': label
@@ -140,6 +179,10 @@ class AoEEventDataset(Dataset):
         # encode entity tokens
         ent_ids = [encode_token(e, self.entity_vocab) for e in ex['entities']]
         event_ids = [encode_token(ev, self.event_vocab) for ev in ex['events']]
+        wood_arr = [w for w in ex['wood']]
+        gold_arr = [w for w in ex['gold']]
+        stone_arr = [w for w in ex['stone']]
+        food_arr = [w for w in ex['food']]
 
         # truncate only if max_len is set and shorter than the sequence; otherwise keep all events
         if self.max_len is not None and len(ent_ids) > self.max_len:
@@ -170,11 +213,20 @@ class AoEEventDataset(Dataset):
         else:
             times_arr = np.zeros((0,), dtype=np.float32)
 
+        # map id: use UNK if mapping not found or map token missing
+        map_token = ex.get('map', UNK_TOKEN)
+        map_id = self.map_vocab.get(str(map_token), self.map_vocab.get(UNK_TOKEN, 1))
+
         sample = {
             'game_id': ex['game_id'],
             'entity_ids': torch.tensor(ent_ids, dtype=torch.long),
             'event_ids': torch.tensor(event_ids, dtype=torch.long),
+            'wood': torch.tensor(wood_arr, dtype=torch.int),
+            'stone': torch.tensor(stone_arr, dtype=torch.int),
+            'gold': torch.tensor(gold_arr, dtype=torch.int),
+            'food': torch.tensor(food_arr, dtype=torch.int),
             'times': torch.tensor(times_arr, dtype=torch.float32),
+            'map': torch.tensor(map_id, dtype=torch.long),
             'player_civ': torch.tensor(self.civ_vocab.get(ex['player_civ'], self.civ_vocab.get(UNK_TOKEN, 1)), dtype=torch.long),
             'enemy_civ': torch.tensor(self.civ_vocab.get(ex['enemy_civ'], self.civ_vocab.get(UNK_TOKEN, 1)), dtype=torch.long),
             'label': torch.tensor(ex['label'], dtype=torch.float32)
@@ -192,14 +244,20 @@ def collate_fn(batch: List[dict]) -> dict:
         - 'event_ids': Padded tensor of shape (B, max_len) containing event token ids.
         - 'times': Padded tensor of shape (B, max_len) containing time values in seconds.
         - 'attention_mask': Padded tensor of shape (B, max_len) containing attention mask values.
+        - 'map': Tensor of shape (B) containing map IDs.
         - 'player_civ': Tensor of shape (B) containing player civ IDs.
         - 'enemy_civ': Tensor of shape (B) containing enemy civ IDs.
         - 'labels': Tensor of shape (B) containing win probability labels.
     """
     batch_entity = [b['entity_ids'] for b in batch]
     batch_event = [b['event_ids'] for b in batch]
+    batch_wood = [b['wood'] for b in batch]
+    batch_food = [b['food'] for b in batch]
+    batch_stone = [b['stone'] for b in batch]
+    batch_gold = [b['gold'] for b in batch]
     batch_times = [b['times'] for b in batch]
     labels = torch.stack([b['label'] for b in batch])
+    maps = torch.stack([b['map'] for b in batch])
     civs = torch.stack([b['player_civ'] for b in batch])
     enemy_civs = torch.stack([b['enemy_civ'] for b in batch])
 
@@ -207,20 +265,33 @@ def collate_fn(batch: List[dict]) -> dict:
     padded_entities = torch.zeros((len(batch), max_len), dtype=torch.long)
     padded_events = torch.zeros((len(batch), max_len), dtype=torch.long)
     padded_times = torch.zeros((len(batch), max_len), dtype=torch.float32)
+    padded_wood = torch.zeros((len(batch), max_len), dtype=torch.int)
+    padded_food = torch.zeros((len(batch), max_len), dtype=torch.int)
+    padded_stone = torch.zeros((len(batch), max_len), dtype=torch.int)
+    padded_gold = torch.zeros((len(batch), max_len), dtype=torch.int)
     attention_mask = torch.zeros((len(batch), max_len), dtype=torch.bool)
 
     for i in range(len(batch)):
         l = batch_entity[i].size(0)
         padded_entities[i, :l] = batch_entity[i]
         padded_events[i, :l] = batch_event[i]
+        # padded_wood[i, :l] = batch_wood[i]
+        # padded_food[i, :l] = batch_food[i]
+        # padded_gold[i, :l] = batch_stone[i]
+        # padded_stone[i, :l] = batch_gold[i]
         padded_times[i, :l] = batch_times[i]
         attention_mask[i, :l] = 1
 
     return {
         'entity_ids': padded_entities,
         'event_ids': padded_events,
+        # 'wood': padded_wood,
+        # 'stone': padded_stone,
+        # 'food': padded_food,
+        # 'gold': padded_gold,
         'times': padded_times,
         'attention_mask': attention_mask,
+        'map': maps,
         'player_civ': civs,
         'enemy_civ': enemy_civs,
         'labels': labels

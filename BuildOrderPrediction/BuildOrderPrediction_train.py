@@ -2,8 +2,9 @@
 Train BuildOrderGenerator from sequences using supervised teacher forcing.
 
 Usage:
-  python train_buildorder.py --csv transformer_input.csv --epochs 10 --batch_size 64 --device cuda
-"""
+  python BuildOrderPrediction/BuildOrderPrediction_train.py --csv transformer_input.csv --epochs 50 --batch_size 64 --device cuda --truncation_strategy head --max_len 128
+
+  """
 import argparse
 import os
 import random
@@ -14,6 +15,9 @@ from sklearn.model_selection import train_test_split
 from tqdm import tqdm
 import wandb
 
+# Ensure project root is on PYTHONPATH for local imports
+import sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from aoe_player_game_datset import build_vocabs, AoEEventDataset, collate_fn
 from BuildOrderTransformerModel import BuildOrderGenerator, BuildOrderTrainer, load_pretrained_win_model
 
@@ -49,10 +53,10 @@ def build_civ_entity_mask(dataset, entity_vocab, num_civs):
         civ_id = dataset.civ_vocab.get(p_civ, dataset.civ_vocab.get('<UNK>', 1))
         for ent in ex['entities']:
             ent_id = dataset.entity_vocab.get(ent, dataset.entity_vocab.get('<UNK>', 1))
+
             if ent_id < vocab_size:
                 mask[civ_id, ent_id] = True
 
-    print("Civ-Entity mask built:", mask)
     return mask
 
 
@@ -78,7 +82,7 @@ def evaluate(trainer, dataloader, device):
                 player_civ=batch['player_civ'],
                 enemy_civ=batch['enemy_civ'],
                 target_sequence_length=batch['entity_ids'].size(1),
-                target_win_prob=batch.get('labels', None),
+                target_win_prob=None, # batch.get('labels', None) -> not used during eval to prevent leakage
                 teacher_forcing_ratio=1.0,  # use teacher forcing for supervised loss
                 ground_truth=(batch['entity_ids'], batch['event_ids'], batch['times']),
                 allowed_entities_mask=allowed
@@ -129,7 +133,7 @@ def main(args):
     dataset_longest = int(grouped.max()) if len(grouped) > 0 else 0
     desired_max_len = args.max_len if args.max_len is not None else min(dataset_longest, args.max_pos_embed_cap)
 
-    dataset = AoEEventDataset(args.csv, vocabs['entity_vocab'], vocabs['event_vocab'], vocabs['civ_vocab'], max_len=desired_max_len, truncation_strategy=args.truncation_strategy)
+    dataset = AoEEventDataset(args.csv, vocabs['entity_vocab'], vocabs['event_vocab'], vocabs['civ_vocab'], vocabs['map_vocab'], max_len=desired_max_len, truncation_strategy=args.truncation_strategy)
 
     model_max_len = desired_max_len if desired_max_len > 0 else 1
 
@@ -164,11 +168,11 @@ def main(args):
     # create civ->entity mask and register
     civ_mask = build_civ_entity_mask(dataset, vocabs['entity_vocab'], num_civs=len(vocabs['civ_vocab']) + 1)
     model.set_civ_entity_mask(civ_mask.to(device))
-
+    reward_model = load_pretrained_win_model(args.reward_model_path, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    trainer = BuildOrderTrainer(model, optimizer, device=device, use_amp=args.use_amp, grad_accum_steps=args.grad_accum_steps)
-
+    trainer = BuildOrderTrainer(model, optimizer, device=device, use_amp=args.use_amp, grad_accum_steps=args.grad_accum_steps,
+                                reward_model=reward_model)
     best_val_loss = float('inf')
     remediation_attempts = 0
     max_remediations = 3
@@ -182,8 +186,10 @@ def main(args):
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device)
+            # Scheduled teacher forcing: decay linearly from 1.0 to 0.0
+            current_tf = max(0.0, 1.0 - (epoch / args.epochs))
             try:
-                loss_dict = trainer.train_step(batch, teacher_forcing_ratio=args.teacher_forcing)
+                loss_dict = trainer.train_step(batch, teacher_forcing_ratio=current_tf)
             except RuntimeError as e:
                 if 'out-of-memory' in str(e).lower() and remediation_attempts < max_remediations:
                     remediation_attempts += 1
@@ -239,7 +245,7 @@ def main(args):
         print(f'Epoch {epoch}: train_loss={float(np.mean(epoch_losses)):.4f} val_loss={val_loss:.4f} val_auc={val_auc:.4f} val_acc={val_acc:.4f}')
 
         if run is not None:
-            run.log({'epoch': epoch, 'train_loss': float(np.mean(epoch_losses)), 'val_loss': val_loss, 'val_auc': val_auc, 'val_acc': val_acc})
+            run.log({'epoch': epoch, 'train_loss': float(np.mean(epoch_losses)), 'val_loss': val_loss, 'val_auc': val_auc, 'val_acc': val_acc, 'teacher_forcing': current_tf})
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -264,6 +270,7 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--lr', type=float, default=1e-4)
     parser.add_argument('--device', type=str, default='cuda')
+    parser.add_argument('--reward_model_path', type=str, default='best_model.pt')
     parser.add_argument('--val_split', type=float, default=0.1)
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--output', type=str, default='best_buildorder_model.pt')
@@ -276,7 +283,6 @@ if __name__ == '__main__':
     parser.add_argument('--max_len', type=int, default=None)
     parser.add_argument('--max_pos_embed_cap', type=int, default=1024)
     parser.add_argument('--truncation_strategy', choices=['head','tail','head_tail'], default='head_tail')
-    parser.add_argument('--teacher_forcing', type=float, default=1.0, help='Fraction of teacher forcing during training (0-1)')
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of steps to accumulate gradients before stepping optimizer')
     parser.add_argument('--use_amp', action='store_true', default=True, help='Use automatic mixed precision (AMP) to reduce memory')
     parser.add_argument('--use_wandb', dest='use_wandb', action='store_true', default=True, help='Enable Weights & Biases logging')

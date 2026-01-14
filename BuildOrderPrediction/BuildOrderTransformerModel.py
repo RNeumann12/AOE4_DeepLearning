@@ -65,6 +65,12 @@ class BuildOrderGenerator(nn.Module):
         
         # 5. Conditioning Projection
         self.condition_proj = nn.Linear(d_model * 3, d_model)  # Player civ + enemy civ + win prob
+
+        # Projection to combine entity/event/pos embeddings before decoding
+        self.combine_proj = nn.Linear(d_model * 3, d_model)
+
+        # Normalization layer applied to combined decoder inputs
+        self.decoder_norm = nn.LayerNorm(d_model)
         
         # 6. Win Probability Head (optional, can use pretrained model)
         self.win_prob_head = nn.Sequential(
@@ -75,9 +81,17 @@ class BuildOrderGenerator(nn.Module):
             nn.Linear(d_model // 2, 1)
         )
         
+        # 7. Condition Embedding (Loss=0, Win=1, Unknown=2)
+        # We replace the float projection with a learnable embedding to avoid 0.0 (Loss) vs None (Unknown) ambiguity
+        self.win_condition_embed = nn.Embedding(3, d_model)
+        
         # Special tokens (include sequence dim so they can be expanded to (B,1,D))
         self.start_token_entity = nn.Parameter(torch.randn(1, 1, d_model))
         self.start_token_event = nn.Parameter(torch.randn(1, 1, d_model))
+        with torch.no_grad():
+            # Initialize start tokens from the mean embedding (shape: (1,1,d_model))
+            self.start_token_entity.copy_(self.entity_embed.weight.mean(dim=0, keepdim=True).unsqueeze(1))
+            self.start_token_event.copy_(self.event_embed.weight.mean(dim=0, keepdim=True).unsqueeze(1))
 
         # Mask sentinel value (fp16-safe) used when masking logits with AMP enabled
         # Use a large negative number that fits in float16 range (max ~ -65504). We pick -1e4.
@@ -89,19 +103,25 @@ class BuildOrderGenerator(nn.Module):
         Encode the condition (civ matchup + optional target win probability)
         """
         batch_size = player_civ.size(0)
+        device = player_civ.device
         
         # Embed civilizations
         p_civ = self.civ_embed(player_civ)  # (B, d_model)
         e_civ = self.civ_embed(enemy_civ)    # (B, d_model)
         
+        # Embed win condition
         if target_win_prob is not None:
-            # Project win probability to same dimension
-            win_prob_embed = target_win_prob.unsqueeze(-1).expand(-1, self.d_model)
-            condition = torch.cat([p_civ, e_civ, win_prob_embed], dim=1)
+            # Discretize: <0.5 -> Loss (0), >=0.5 -> Win (1)
+            # Input is expected to be probabilities 0.0 to 1.0
+            cond_indices = (target_win_prob >= 0.5).long()
         else:
-            # Use zeros for win prob dimension
-            zeros = torch.zeros_like(p_civ)
-            condition = torch.cat([p_civ, e_civ, zeros], dim=1)
+            # Unknown -> 2
+            cond_indices = torch.full((batch_size,), 2, dtype=torch.long, device=device)
+            
+        win_embed = self.win_condition_embed(cond_indices) # (B, d_model)
+        
+        # Concatenate: [p_civ, e_civ, win_embed]
+        condition = torch.cat([p_civ, e_civ, win_embed], dim=1)
             
         # Project to d_model
         condition = self.condition_proj(condition)  # (B, d_model)
@@ -182,7 +202,59 @@ class BuildOrderGenerator(nn.Module):
         all_entity_logits = []
         all_event_logits = []
         all_time_preds = []
-        
+
+        # ============================================
+        # PARALLEL TRAINING MODE (teacher_forcing_ratio == 1.0)
+        # ============================================
+        if self.training and teacher_forcing_ratio == 1.0 and ground_truth is not None:
+            entity_targets, event_targets, time_targets = ground_truth
+            seq_len = entity_targets.size(1)
+            batch_size = entity_targets.size(0)
+
+            # Build shifted decoder inputs: [START] + ground_truth[:, :-1]
+            if seq_len > 1:
+                entity_input_emb = torch.cat([
+                    self.start_token_entity.expand(batch_size, 1, -1),
+                    self.entity_embed(entity_targets[:, :-1])
+                ], dim=1)
+                event_input_emb = torch.cat([
+                    self.start_token_event.expand(batch_size, 1, -1),
+                    self.event_embed(event_targets[:, :-1])
+                ], dim=1)
+            else:
+                entity_input_emb = self.start_token_entity.expand(batch_size, 1, -1)
+                event_input_emb = self.start_token_event.expand(batch_size, 1, -1)
+
+            positions = torch.arange(0, entity_input_emb.size(1), device=device).unsqueeze(0).expand(batch_size, entity_input_emb.size(1))
+            pos_emb = self.seq_pos_embed(positions)
+            # Combine via normalization of summed embeddings (stabilizes training when teacher forcing)
+            decoder_input = self.decoder_norm(entity_input_emb + event_input_emb + pos_emb)
+
+            tgt_mask = self.generate_square_subsequent_mask(decoder_input.size(1)).to(device)
+            decoder_output = self.decoder(decoder_input, memory, tgt_mask=tgt_mask)
+
+            # Compute logits for all positions in parallel
+            entity_logits = self.entity_head(decoder_output)  # (B, L, V)
+            event_logits = self.event_head(decoder_output)    # (B, L, V)
+            time_preds = torch.relu(self.time_head(decoder_output)).squeeze(-1)  # (B, L)
+
+            # Derive allowed mask if not provided
+            if allowed_entities_mask is None and hasattr(self, 'civ_entity_mask') and self.civ_entity_mask is not None:
+                allowed = self.civ_entity_mask[player_civ]
+            else:
+                allowed = allowed_entities_mask
+
+            # Apply civ-based mask if provided
+            if allowed is not None:
+                allowed_b1v = allowed.unsqueeze(1)  # (B, 1, V)
+                entity_logits = entity_logits.masked_fill(~allowed_b1v, self.mask_value)
+
+            # Predict win prob from final decoder output
+            final_output = decoder_output[:, -1, :]
+            win_logits = self.win_prob_head(final_output).squeeze(-1)
+
+            return entity_logits, event_logits, time_preds, win_logits
+
         # Generate sequence autoregressively
         for step in range(target_sequence_length):
             # Current sequence length (including start token + generated steps)
@@ -192,8 +264,8 @@ class BuildOrderGenerator(nn.Module):
             positions = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, seq_len)
             pos_emb = self.seq_pos_embed(positions)  # (B, seq_len, d_model)
             
-            # Combine current embeddings with positional encoding
-            decoder_input = (current_entities + current_events + pos_emb) / 3.0  # (B, seq_len, d_model)
+            # Combine current embeddings with positional encoding via LayerNorm on the sum
+            decoder_input = self.decoder_norm(current_entities + current_events + pos_emb)
             
             # Create causal mask for decoder
             tgt_mask = self.generate_square_subsequent_mask(seq_len).to(device)
@@ -211,7 +283,7 @@ class BuildOrderGenerator(nn.Module):
             # Predict next tokens
             entity_logits = self.entity_head(last_output)  # (B, 1, vocab_size_entity)
             event_logits = self.event_head(last_output)    # (B, 1, vocab_size_event)
-            time_delta = torch.relu(self.time_head(last_output)).squeeze(-1)  # (B, 1)
+            time_delta = torch.nn.functional.softplus(self.time_head(last_output)).squeeze(-1)
 
             # Derive allowed mask if not provided
             if allowed_entities_mask is None and hasattr(self, 'civ_entity_mask') and self.civ_entity_mask is not None:
@@ -315,7 +387,7 @@ class BuildOrderGenerator(nn.Module):
                     positions = torch.arange(0, seq_len, device=device).unsqueeze(0)
                     pos_emb = self.seq_pos_embed(positions)  # (1, seq_len, d_model)
 
-                    decoder_input = (beam['entity_embs'] + beam['event_embs'] + pos_emb) / 3.0
+                    decoder_input = self.decoder_norm(beam['entity_embs'] + beam['event_embs'] + pos_emb)
                     tgt_mask = self.generate_square_subsequent_mask(seq_len).to(device)
 
                     with torch.no_grad():
@@ -380,7 +452,7 @@ class BuildOrderGenerator(nn.Module):
                 seq_len = beam['entities'].size(0) + 1
                 positions = torch.arange(0, seq_len, device=device).unsqueeze(0)
                 pos_emb = self.seq_pos_embed(positions)
-                decoder_input = (beam['entity_embs'] + beam['event_embs'] + pos_emb) / 3.0
+                decoder_input = self.decoder_norm(beam['entity_embs'] + beam['event_embs'] + pos_emb)
                 tgt_mask = self.generate_square_subsequent_mask(seq_len).to(device)
 
                 with torch.no_grad():
@@ -476,8 +548,8 @@ class BuildOrderTrainer:
         total_loss = (
             entity_loss * 1.0 +
             event_loss * 1.0 +
-            time_loss * 0.1 +  # Lower weight for time
-            win_loss * 0.5     # Moderate weight for win prob
+            time_loss * 0.8 + 
+            win_loss * 0.5    
         )
         
         return total_loss, {
@@ -512,6 +584,12 @@ class BuildOrderTrainer:
             allowed_entities_mask = None
 
         try:
+            # Condition Dropout: with probability 0.2, mask the win condition (set to None)
+            # to force the model to learn from the sequence itself rather than just the label.
+            input_win_probs = target_win_probs
+            if self.model.training and target_win_probs is not None and torch.rand(1).item() < 0.2:
+                 input_win_probs = None
+
             if self.scaler is not None:
                 # AMP forward/backward with chosen dtype (float16 on CUDA, bfloat16 on ROCm)
                 with torch.amp.autocast(device_type=self.amp_device, dtype=self.amp_dtype):
@@ -519,7 +597,7 @@ class BuildOrderTrainer:
                         player_civ=player_civ,
                         enemy_civ=enemy_civ,
                         target_sequence_length=entity_ids.size(1),
-                        target_win_prob=target_win_probs,
+                        target_win_prob=input_win_probs,
                         teacher_forcing_ratio=teacher_forcing_ratio,
                         ground_truth=(entity_ids, event_ids, times),
                         allowed_entities_mask=allowed_entities_mask
@@ -542,7 +620,7 @@ class BuildOrderTrainer:
                     player_civ=player_civ,
                     enemy_civ=enemy_civ,
                     target_sequence_length=entity_ids.size(1),
-                    target_win_prob=target_win_probs,
+                    target_win_prob=input_win_probs,
                     teacher_forcing_ratio=teacher_forcing_ratio,
                     ground_truth=(entity_ids, event_ids, times),
                     allowed_entities_mask=allowed_entities_mask
@@ -618,6 +696,7 @@ def load_pretrained_win_model(checkpoint_path, device='cuda'):
         vocab_size_entity=len(vocabs['entity_vocab']),
         vocab_size_event=len(vocabs['event_vocab']),
         civ_vocab_size=len(vocabs['civ_vocab']),
+        map_vocab_size=len(vocabs['map_vocab']),
         d_model=128,
         nhead=4,
         num_layers=3,
@@ -630,103 +709,3 @@ def load_pretrained_win_model(checkpoint_path, device='cuda'):
     win_model.eval()
 
     return win_model, vocabs
-
-
-# Example usage
-if __name__ == "__main__":
-    # Minimal example vocabs (include explicit pad id = 0 for civs)
-    entity_vocab = {"villager": 1, "scout": 2, "spearman": 3, "knight": 4, "archer": 5}
-    event_vocab = {"train": 1, "build": 2, "research": 3}
-    civ_vocab = {"pad": 0, "English": 1, "French": 2}
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    # Create generator model and move to device
-    vocab_size_entity = len(entity_vocab) + 1
-    vocab_size_event = len(event_vocab) + 1
-    num_civs = max(civ_vocab.values()) + 1
-
-    generator = BuildOrderGenerator(
-        vocab_size_entity=vocab_size_entity,
-        vocab_size_event=vocab_size_event,
-        civ_vocab_size=num_civs,
-        d_model=128,
-        nhead=4,
-        num_encoder_layers=2,
-        num_decoder_layers=3,
-        dim_feedforward=256,
-        dropout=0.1,
-        max_len=100
-    ).to(device)
-
-    # Build a civ -> entity allowed mask and register it
-    # Shape: (num_civs, vocab_size_entity) -- index 0 is padding civ
-    civ_mask = torch.zeros((num_civs, vocab_size_entity), dtype=torch.bool)
-    # English (1): allow villager(1), scout(2), spearman(3)
-    civ_mask[1, 1] = True
-    civ_mask[1, 2] = True
-    civ_mask[1, 3] = True
-    # French (2): allow villager(1), scout(2), knight(4), archer(5)
-    civ_mask[2, 1] = True
-    civ_mask[2, 2] = True
-    civ_mask[2, 4] = True
-    civ_mask[2, 5] = True
-
-    # Register mask on the model (moves to device with the model)
-    generator.set_civ_entity_mask(civ_mask.to(device))
-
-    # Optional: Load pretrained win prediction model for reward (if available)
-    try:
-        win_model, vocabs = load_pretrained_win_model("best_model.pt", device=device)
-    except Exception as e:
-        print(f"Could not load pretrained win model: {e}")
-        win_model = None
-
-    # Create trainer
-    optimizer = torch.optim.AdamW(generator.parameters(), lr=1e-4)
-    trainer = BuildOrderTrainer(generator, optimizer, device=device)
-
-    # Create a synthetic batch and run a training step (the trainer derives allowed mask from model)
-    B = 2
-    L = 6
-    player_civ = torch.tensor([1, 2], dtype=torch.long, device=device)
-    enemy_civ = torch.tensor([2, 1], dtype=torch.long, device=device)
-    entity_ids = torch.zeros(B, L, dtype=torch.long, device=device)
-    event_ids = torch.zeros(B, L, dtype=torch.long, device=device)
-    times = torch.zeros(B, L, dtype=torch.float, device=device)
-    labels = torch.tensor([1, 0], dtype=torch.float, device=device)
-
-    batch = {
-        'player_civ': player_civ,
-        'enemy_civ': enemy_civ,
-        'entity_ids': entity_ids,
-        'event_ids': event_ids,
-        'times': times,
-        'labels': labels
-    }
-
-    loss_dict = trainer.train_step(batch, teacher_forcing_ratio=1.0)
-    print("Trainer step losses:", loss_dict)
-
-    # Run a forward pass in inference mode using an explicit allowed mask override
-    generator.eval()
-    with torch.no_grad():
-        # Derive allowed mask for batch from civ mask directly (same shape used by model)
-        allowed_mask_batch = generator.civ_entity_mask[player_civ].to(device)
-        ent_logits, ev_logits, t_preds, win_logits = generator(
-            player_civ=player_civ,
-            enemy_civ=enemy_civ,
-            target_sequence_length=4,
-            teacher_forcing_ratio=0.0,
-            ground_truth=None,
-            allowed_entities_mask=allowed_mask_batch
-        )
-    print("Example entity logits (first batch, first timestep):", ent_logits[0, 0])
-    print("Win logits:", win_logits)
-
-    # Generate an optimal build order using beam search (trainer helper)
-    english_id = civ_vocab["English"]
-    french_id = civ_vocab["French"]
-    seq, win_prob = trainer.generate_optimal_build_order(english_id, french_id, beam_width=4, max_length=8)
-    print("Generated build:", seq)
-    print("Predicted win probability:", win_prob)
