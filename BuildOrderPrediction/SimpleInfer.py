@@ -2,11 +2,12 @@
 """Infer a build order using a trained SequencePredictor model.
 
 Example:
-  python BuildOrderPrediction/SimpleInfer.py --checkpoint best_model.pth --top_probs 5 --player_civ English --enemy_civ French --map "High View" --build_steps 30 --temperature 0.3
+  python BuildOrderPrediction/SimpleInfer.py --checkpoint best_model.pth --top_probs 5 --player_civ English --enemy_civ French --map "High View" --build_steps 30 --temperature 0.3 --top_p 0.9 --seed 42
 """
 import os
 import sys
 import argparse
+import random
 from typing import Dict
 
 import torch
@@ -99,13 +100,15 @@ def generate_build_order(
     entity_vocab: Dict[str, int],
     num_steps: int,
     device: torch.device,
-    temperature: float = 1.0,
+    temperature: float = 0.7,
     top_k: int = None,
+    top_p: float = 0.9,
     exclude_special: bool = True,
     civ_entity_mapping: Dict[str, set] = None,
     player_civ_name: str = None,
     top_probs: int = 0,
-    greedy: bool = False
+    greedy: bool = False,
+    seed: int = None
 ):
     """Generate a build order given condition parameters.
     
@@ -115,8 +118,25 @@ def generate_build_order(
         exclude_special: If True, mask out PAD and UNK tokens from predictions
         top_probs: Number of top entity probabilities to print per step (0 = disabled)
         greedy: If True, use argmax for deterministic sampling instead of multinomial
+        top_p: Nucleus sampling threshold (default 0.9). Set to 1.0 to disable.
+        seed: Random seed for reproducible generation. If None, results vary each run.
     """
+    # Set random seed for reproducibility
+    if seed is not None:
+        torch.manual_seed(seed)
+        random.seed(seed)
+        if device.type == 'cuda':
+            torch.cuda.manual_seed(seed)
     model.eval()
+    
+    # Get the model's max sequence length (account for 3 condition tokens)
+    # The model uses positions 0-2 for conditions, so entity positions start at 3
+    max_entity_seq_len = model.max_seq_len - 1  # Leave room for safety
+    truncation_warned = False  # Only warn once about truncation
+    
+    if num_steps > max_entity_seq_len:
+        print(f"  Warning: Requesting {num_steps} steps but model max context is {max_entity_seq_len}")
+        print(f"           Older context will be truncated during generation.")
     
     # Prepare condition tensors
     player_civ = torch.tensor([player_civ_id], dtype=torch.long, device=device)
@@ -165,6 +185,12 @@ def generate_build_order(
     
     with torch.no_grad():
         for step_num in range(num_steps):
+            # Truncate sequence if it exceeds model's max length
+            # Keep the most recent tokens (sliding window) to stay within bounds
+            if entity_seq.size(1) > max_entity_seq_len:
+                # Keep the last max_entity_seq_len tokens
+                entity_seq = entity_seq[:, -max_entity_seq_len:]
+            
             # Forward pass
             entity_logits = model(
                 entity_seq,
@@ -195,6 +221,23 @@ def generate_build_order(
                         torch.full_like(entity_logits, float('-inf')),
                         entity_logits
                     )
+            
+            # Apply top-p (nucleus) sampling if specified
+            if top_p is not None and top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(entity_logits, descending=True)
+                cumulative_probs = torch.cumsum(torch.softmax(sorted_logits, dim=-1), dim=-1)
+                
+                # Remove tokens with cumulative probability above the threshold
+                sorted_indices_to_remove = cumulative_probs > top_p
+                # Shift the indices to the right to keep the first token above threshold
+                sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+                sorted_indices_to_remove[..., 0] = 0
+                
+                # Scatter sorted tensors to original indexing
+                indices_to_remove = sorted_indices_to_remove.scatter(
+                    dim=-1, index=sorted_indices, src=sorted_indices_to_remove
+                )
+                entity_logits[indices_to_remove] = float('-inf')
             
             # Sample
             entity_probs = torch.softmax(entity_logits, dim=-1)
@@ -280,14 +323,18 @@ def main():
                        help='Number of build order steps to generate (default: 20)')
     
     # Generation parameters
-    parser.add_argument('--temperature', type=float, default=1.0,
-                       help='Sampling temperature (default: 1.0, higher = more random)')
+    parser.add_argument('--temperature', type=float, default=0.7,
+                       help='Sampling temperature (default: 0.7, higher = more random, lower = more focused)')
     parser.add_argument('--top_k', type=int, default=None,
                        help='Top-k sampling (default: None = no filtering)')
+    parser.add_argument('--top_p', type=float, default=0.9,
+                       help='Nucleus (top-p) sampling threshold (default: 0.9, set to 1.0 to disable)')
     parser.add_argument('--top_probs', type=int, default=0,
                        help='Print top X entity probabilities per generation step (default: 0 = disabled)')
     parser.add_argument('--greedy', action='store_true',
                        help='Use greedy decoding (always pick highest probability) instead of sampling')
+    parser.add_argument('--seed', type=int, default=None,
+                       help='Random seed for reproducible generation (default: None = random each run)')
     
     # Device
     parser.add_argument('--device', type=str, default='auto',
@@ -339,6 +386,10 @@ def main():
     print(f"  Map:        {args.map} (id={map_id})")
     print(f"  Steps:      {args.build_steps}")
     
+    # Set global seed if provided
+    if args.seed is not None:
+        print(f"  Seed:       {args.seed}")
+    
     # Generate build order (with civ-entity masking if available)
     entities = generate_build_order(
         model=model,
@@ -350,10 +401,12 @@ def main():
         device=device,
         temperature=args.temperature,
         top_k=args.top_k,
+        top_p=args.top_p,
         civ_entity_mapping=civ_entity_mapping,
         player_civ_name=args.player_civ,
         top_probs=args.top_probs,
-        greedy=args.greedy
+        greedy=args.greedy,
+        seed=args.seed
     )
     
     # Print results

@@ -11,11 +11,94 @@ import wandb
 from torch.utils.data import Dataset, DataLoader, Subset
 from sklearn.model_selection import train_test_split
 
+"""
+Train SimpleBuildOrderGenerator from sequences.
+
+Usage:
+  python BuildOrderPrediction/SimpleBuildOrderPrediction_train.py
+
+  """
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance.
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    """
+    def __init__(self, alpha: Optional[torch.Tensor] = None, gamma: float = 2.0, reduction: str = 'mean', ignore_index: int = -100):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+        self.ignore_index = ignore_index
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input: (B, C) or (B, L, C) logits (sequence models typically output B, L, C)
+            target: (B,) or (B, L) indices
+        """
+        if input.ndim > 2:
+            # (B, L, C) -> (B*L, C)
+            c = input.shape[2]  # C is the last dimension for (B, L, C)
+            input = input.reshape(-1, c)
+            target = target.reshape(-1)
+
+        log_pt = F.log_softmax(input, dim=-1)
+        pt = torch.exp(log_pt)
+        
+        # Calculate cross entropy (without reduction yet)
+        ce_loss = F.nll_loss(log_pt, target, reduction='none', ignore_index=self.ignore_index)
+        
+        # Calculate modulating factor: (1 - pt)^gamma
+        pt_gather = pt.gather(1, target.unsqueeze(1)).squeeze(1)
+        modulating_factor = (1 - pt_gather) ** self.gamma
+        
+        # Apply alpha weighting if provided
+        weight = None
+        if self.alpha is not None:
+            self.alpha = self.alpha.to(input.device)
+            # Alpha for the target class
+            alpha_t = self.alpha[target]
+            # Handle ignore_index in alpha lookup (though nll_loss handles it for loss)
+            # We can just set alpha to 1 for ignored indices to avoid gather errors if target has ignore_index
+            # But standard gather will fail if index is out of bounds (negative).
+            # Usually ignore_index is -100.
+            
+            # To be safe, we rely on ce_loss being 0 for ignore_index, 
+            # so the value of alpha_t doesn't matter there, but we must not error on lookup.
+             # Create a mask for valid targets
+            valid_mask = target != self.ignore_index
+            
+            # Create a safe target tensor for gathering (replace ignore_index with 0)
+            safe_target = torch.where(valid_mask, target, torch.zeros_like(target))
+            
+            alpha_t = self.alpha[safe_target]
+            
+            focal_loss = alpha_t * modulating_factor * ce_loss
+        else:
+            focal_loss = modulating_factor * ce_loss
+        
+        if self.reduction == 'mean':
+            # Compute mean only over non-ignored indices
+            valid_count = (target != self.ignore_index).float().sum()
+            return focal_loss.sum() / torch.clamp(valid_count, min=1.0)
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
 class SequencePredictor(nn.Module):
     """
-    Transformer-based sequence predictor for entity build orders.
-    Predicts the next entity in a sequence (focuses on build order placement).
+    Causal Transformer for entity build order prediction.
+    Uses decoder-style causal masking to prevent looking at future tokens.
     Conditioned on player civilization, enemy civilization, and map.
+    
+    Key improvements over encoder-only:
+    1. Causal attention mask - each position can only attend to past positions
+    2. Learnable position embeddings for better pattern learning
+    3. Pre-norm architecture for training stability
+    4. Embedding scaling for better gradient flow
     """
     
     def __init__(self,
@@ -32,79 +115,96 @@ class SequencePredictor(nn.Module):
         
         self.d_model = d_model
         self.max_seq_len = max_seq_len
+        self.vocab_size_entity = vocab_size_entity
         
-        # 1. Entity embedding (focus on build order, not events)
+        # 1. Entity embedding with scaling
         self.entity_embed = nn.Embedding(vocab_size_entity, d_model)
+        self.embed_scale = math.sqrt(d_model)
         
         # 2. Condition embeddings (player civ, enemy civ, map)
-        self.civ_embed = nn.Embedding(civ_vocab_size, d_model)
+        # Use separate embeddings for player vs enemy civ for clarity
+        self.player_civ_embed = nn.Embedding(civ_vocab_size, d_model)
+        self.enemy_civ_embed = nn.Embedding(civ_vocab_size, d_model)
         self.map_embed = nn.Embedding(map_vocab_size, d_model)
-        self.condition_proj = nn.Linear(d_model * 3, d_model)  # player_civ + enemy_civ + map
         
-        # 3. Positional encoding
-        # Allow for extra tokens (BOS, condition embedding) by adding margin
-        self.pos_encoder = PositionalEncoding(d_model, dropout, max_len=max_seq_len + 32)
+        # 3. Learnable position embeddings (better than sinusoidal for this task)
+        # +3 for condition tokens, +1 for safety margin
+        self.pos_embed = nn.Embedding(max_seq_len + 4, d_model)
         
-        # 4. Transformer encoder for sequence understanding
-        encoder_layer = nn.TransformerEncoderLayer(
+        # 4. Input layer norm and dropout
+        self.embed_ln = nn.LayerNorm(d_model)
+        self.embed_dropout = nn.Dropout(dropout)
+        
+        # 5. Transformer decoder layers with causal masking
+        decoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model,
             nhead=nhead,
             dim_feedforward=dim_feedforward,
             dropout=dropout,
             activation='gelu',
-            batch_first=True
+            batch_first=True,
+            norm_first=True  # Pre-norm for training stability
         )
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers)
+        self.transformer = nn.TransformerEncoder(decoder_layer, num_layers)
         
-        # 5. Output head for entity prediction only
-        self.entity_head = nn.Sequential(
-            nn.Linear(d_model, d_model),
-            nn.LayerNorm(d_model),
-            nn.GELU(),
-            nn.Dropout(dropout),
-            nn.Linear(d_model, vocab_size_entity)
-        )
+        # 6. Output layer norm (important for pre-norm architecture)
+        self.output_ln = nn.LayerNorm(d_model)
         
-        # 6. Start tokens (learnable)
-        self.start_token = nn.Parameter(torch.randn(1, 1, d_model))
+        # 7. Output head - simpler is better, avoid over-parameterization
+        self.entity_head = nn.Linear(d_model, vocab_size_entity)
         
-        # Mask value for invalid positions
-        self.mask_value = float(-1e4)
+        # 8. Cache for causal mask
+        self._causal_mask_cache = {}
+        
+        # Initialize weights
+        self._init_weights()
     
-    def encode_condition(self, player_civ: torch.Tensor, enemy_civ: torch.Tensor, 
-                         map_id: torch.Tensor) -> torch.Tensor:
-        """
-        Encode conditioning features: player civ + enemy civ + map.
+    def _init_weights(self):
+        """Initialize weights with small values for stability."""
+        # Entity embeddings - small init
+        nn.init.normal_(self.entity_embed.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.player_civ_embed.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.enemy_civ_embed.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.map_embed.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.pos_embed.weight, mean=0.0, std=0.02)
         
-        Args:
-            player_civ: (B,) player civilization IDs
-            enemy_civ: (B,) enemy civilization IDs
-            map_id: (B,) map IDs
+        # Output head - very small init for residual-like behavior
+        nn.init.normal_(self.entity_head.weight, mean=0.0, std=0.02)
+        nn.init.zeros_(self.entity_head.bias)
+    
+    def _get_causal_mask(self, seq_len: int, device: torch.device) -> torch.Tensor:
+        """
+        Create causal attention mask.
+        Returns a mask where True means "do not attend" (masked out).
+        
+        For sequence [Cond1, Cond2, Cond3, E1, E2, E3]:
+        - Condition tokens can attend to each other (fully connected)
+        - Entity tokens can attend to all conditions AND previous entities
+        """
+        cache_key = (seq_len, device)
+        if cache_key not in self._causal_mask_cache:
+            # Create causal mask for the full sequence (including 3 condition tokens)
+            # Shape: (seq_len, seq_len)
+            # mask[i, j] = True means position i cannot attend to position j
             
-        Returns:
-            condition: (B, 1, d_model) condition embedding
-        """
-        p_civ = self.civ_embed(player_civ)   # (B, d_model)
-        e_civ = self.civ_embed(enemy_civ)    # (B, d_model)
-        map_emb = self.map_embed(map_id)     # (B, d_model)
-        
-        # Concatenate and project
-        condition = torch.cat([p_civ, e_civ, map_emb], dim=-1)  # (B, d_model*3)
-        condition = self.condition_proj(condition)  # (B, d_model)
-        
-        return condition.unsqueeze(1)  # (B, 1, d_model)
-        
-    def create_entity_embeddings(self, entity_ids: torch.Tensor) -> torch.Tensor:
-        """
-        Create embeddings for entity sequence (build order).
-        
-        Args:
-            entity_ids: (B, L) entity token ids
+            total_len = seq_len + 3  # +3 for condition tokens
+            mask = torch.ones(total_len, total_len, dtype=torch.bool, device=device)
             
-        Returns:
-            entity_embeddings: (B, L, d_model)
-        """
-        return self.entity_embed(entity_ids)  # (B, L, d_model)
+            # Condition tokens (0, 1, 2) can attend to each other
+            mask[:3, :3] = False
+            
+            # Entity tokens can attend to:
+            # - All condition tokens
+            # - All previous entity tokens (causal)
+            for i in range(3, total_len):
+                # Can attend to all conditions
+                mask[i, :3] = False
+                # Can attend to all previous entities (including self)
+                mask[i, 3:i+1] = False
+            
+            self._causal_mask_cache[cache_key] = mask
+        
+        return self._causal_mask_cache[cache_key]
     
     def forward(self,
                 entity_sequence: torch.Tensor,
@@ -114,7 +214,7 @@ class SequencePredictor(nn.Module):
                 attention_mask: Optional[torch.Tensor] = None,
                 predict_next: bool = True) -> torch.Tensor:
         """
-        Forward pass for entity sequence prediction (build order).
+        Forward pass with causal attention for next-token prediction.
         
         Args:
             entity_sequence: (B, L) entity token ids (padded)
@@ -130,53 +230,65 @@ class SequencePredictor(nn.Module):
         batch_size, seq_len = entity_sequence.shape
         device = entity_sequence.device
         
-        # Encode condition (player civ, enemy civ, map)
-        condition = self.encode_condition(player_civ, enemy_civ, map_id)  # (B, 1, d_model)
+        # 1. Create condition embeddings
+        p_civ = self.player_civ_embed(player_civ)   # (B, d_model)
+        e_civ = self.enemy_civ_embed(enemy_civ)     # (B, d_model)
+        map_emb = self.map_embed(map_id)            # (B, d_model)
+        condition = torch.stack([p_civ, e_civ, map_emb], dim=1)  # (B, 3, d_model)
         
-        # Create entity embeddings for sequence
-        entity_emb = self.create_entity_embeddings(entity_sequence)  # (B, L, d_model)
+        # 2. Create entity embeddings with scaling
+        entity_emb = self.entity_embed(entity_sequence) * self.embed_scale  # (B, L, d_model)
         
-        # Prepend condition to sequence
-        combined_emb = torch.cat([condition, entity_emb], dim=1)  # (B, 1+L, d_model)
+        # 3. Concatenate: [PlayerCiv, EnemyCiv, Map, Entity1, Entity2, ...]
+        combined_emb = torch.cat([condition, entity_emb], dim=1)  # (B, 3+L, d_model)
         
-        # Add positional encoding
-        combined_emb = self.pos_encoder(combined_emb)
+        # 4. Add positional embeddings
+        positions = torch.arange(combined_emb.size(1), device=device)
+        pos_emb = self.pos_embed(positions)  # (3+L, d_model)
+        combined_emb = combined_emb + pos_emb.unsqueeze(0)
         
-        # Create padding mask if not provided
+        # 5. Apply layer norm and dropout
+        combined_emb = self.embed_ln(combined_emb)
+        combined_emb = self.embed_dropout(combined_emb)
+        
+        # 6. Create causal attention mask
+        causal_mask = self._get_causal_mask(seq_len, device)  # (3+L, 3+L)
+        
+        # 7. Create padding mask
         if attention_mask is None:
-            attention_mask = (entity_sequence != 0)  # Assuming 0 is padding token
+            attention_mask = (entity_sequence != 0)  # (B, L)
         
-        # Prepend True (valid) for condition token
-        condition_mask = torch.ones(batch_size, 1, dtype=torch.bool, device=device)
-        attention_mask = torch.cat([condition_mask, attention_mask], dim=1)  # (B, 1+L)
+        # Prepend True for condition tokens
+        condition_mask = torch.ones(batch_size, 3, dtype=torch.bool, device=device)
+        full_mask = torch.cat([condition_mask, attention_mask], dim=1)  # (B, 3+L)
+        src_key_padding_mask = ~full_mask  # True = masked out
         
-        # Convert to transformer format (True positions are allowed, False positions are masked)
-        src_key_padding_mask = ~attention_mask  # Invert for transformer
-        
-        # Apply transformer encoder
-        encoded = self.transformer_encoder(
+        # 8. Apply transformer with causal mask
+        encoded = self.transformer(
             combined_emb,
+            mask=causal_mask,
             src_key_padding_mask=src_key_padding_mask
-        )  # (B, 1+L, d_model)
+        )  # (B, 3+L, d_model)
         
-        # Remove condition token from output (keep only sequence positions)
-        encoded = encoded[:, 1:, :]  # (B, L, d_model)
+        # 9. Apply output layer norm
+        encoded = self.output_ln(encoded)
+        
+        # 10. Remove condition tokens
+        encoded = encoded[:, 3:, :]  # (B, L, d_model)
         
         if predict_next:
-            # Predict only the next element after the sequence
-            # Use the last valid position (from original mask, not including condition)
-            original_mask = attention_mask[:, 1:]  # Remove condition from mask
+            # Get the last valid position for each sequence
+            original_mask = full_mask[:, 3:]
             last_valid_indices = original_mask.sum(dim=1) - 1  # (B,)
             
-            # Gather encoded states at last valid positions
+            # Gather hidden states at last valid positions
             batch_indices = torch.arange(batch_size, device=device)
             last_hidden = encoded[batch_indices, last_valid_indices]  # (B, d_model)
             
             # Predict next entity
             entity_logits = self.entity_head(last_hidden)  # (B, vocab_size_entity)
-            
         else:
-            # Predict next element for each position (teacher forcing style)
+            # Predict for all positions (teacher forcing)
             entity_logits = self.entity_head(encoded)  # (B, L, vocab_size_entity)
         
         return entity_logits
@@ -204,8 +316,7 @@ class SequencePredictor(nn.Module):
         Returns:
             generated_entities: (B, L + max_new_tokens)
         """
-        batch_size = entity_sequence.shape[0]
-        device = entity_sequence.device
+        # batch_size = entity_sequence.shape[0]  # Unused
         
         # Initialize with input sequence
         current_entities = entity_sequence.clone()
@@ -272,6 +383,7 @@ class SequencePredictorTrainer:
     Trainer for the SequencePredictor model.
     """
     
+
     def __init__(self,
                  model: nn.Module,
                  optimizer: torch.optim.Optimizer,
@@ -280,7 +392,9 @@ class SequencePredictorTrainer:
                  grad_accum_steps: int = 1,
                  civ_entity_mask: Optional[torch.Tensor] = None,
                  entity_class_weights: Optional[torch.Tensor] = None,
-                 label_smoothing: float = 0.0):
+                 label_smoothing: float = 0.0,
+                 use_focal_loss: bool = True,
+                 focal_loss_gamma: float = 2.0):
         self.model = model
         self.optimizer = optimizer
         self.device = device
@@ -295,6 +409,17 @@ class SequencePredictorTrainer:
             self.entity_class_weights = self.entity_class_weights.to(device)
             
         self.label_smoothing = label_smoothing
+        self.use_focal_loss = use_focal_loss
+        self.focal_loss_gamma = focal_loss_gamma
+        
+        # Initialize Focal Loss if enabled
+        if self.use_focal_loss:
+            self.criterion = FocalLoss(
+                alpha=self.entity_class_weights,
+                gamma=self.focal_loss_gamma,
+                reduction='mean',
+                ignore_index=-100 # Standard ignore index
+            )
         
         # AMP setup
         self.use_amp = use_amp and torch.cuda.is_available()
@@ -312,7 +437,7 @@ class SequencePredictorTrainer:
                 player_civ: Optional[torch.Tensor] = None,
                 mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
-        Compute loss for entity sequence prediction with masked label smoothing.
+        Compute loss for entity sequence prediction with masked label smoothing or Focal Loss.
         
         Args:
             entity_logits: (B, vocab_size_entity) or (B, L, vocab_size_entity)
@@ -343,7 +468,16 @@ class SequencePredictorTrainer:
         weights = self.entity_class_weights
         
         # Custom Loss Calculation
-        if self.label_smoothing > 0:
+        if self.use_focal_loss:
+            # Use Focal Loss
+            # Focal Loss expects same shape as cross_entropy input
+            if entity_logits.dim() == 3:
+                 # (B, L, V) -> (B, V, L) if using cross_entropy usually, but our FocalLoss handles (B, C, L) check
+                 pass # Our focal loss handles dimensions
+            
+            entity_loss = self.criterion(entity_logits, entity_targets)
+            
+        elif self.label_smoothing > 0:
             # Compute log probabilities
             log_probs = F.log_softmax(entity_logits, dim=-1)
             
@@ -552,6 +686,7 @@ class SequencePredictorTrainer:
         self.model.eval()
         total_loss = 0.0
         total_correct_entity = 0
+        total_correct_top5 = 0
         total_samples = 0
         
         with torch.no_grad():
@@ -590,16 +725,25 @@ class SequencePredictorTrainer:
                 # Compute accuracy
                 entity_preds = torch.argmax(entity_logits, dim=-1)
                 
+                # Compute Top-5 Accuracy
+                _, top5_preds = entity_logits.topk(5, dim=-1)  # (B, 5)
+                # Check if target is in top 5
+                # Expand targets to (B, 1) to compare
+                top5_correct = top5_preds.eq(entity_targets.view(-1, 1).expand_as(top5_preds))
+                total_correct_top5 += top5_correct.sum().item()
+                
                 total_loss += loss.item() * entity_ids.size(0)
                 total_correct_entity += (entity_preds == entity_targets).sum().item()
                 total_samples += entity_ids.size(0)
         
         avg_loss = total_loss / total_samples
         entity_accuracy = total_correct_entity / total_samples
+        entity_top5_accuracy = total_correct_top5 / total_samples
         
         return {
             'loss': avg_loss,
-            'entity_accuracy': entity_accuracy
+            'entity_accuracy': entity_accuracy,
+            'entity_top5_accuracy': entity_top5_accuracy
         }
 
 
@@ -803,32 +947,34 @@ def main():
     # Parse arguments
     parser = argparse.ArgumentParser(description='Train Sequence Predictor')
     parser.add_argument('--csv_path', type=str, default='input_with_map.csv')
-    parser.add_argument('--epochs', type=int, default=50,
+    parser.add_argument('--epochs', type=int, default=100,
                        help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=256,
-                       help='Batch size')
-    parser.add_argument('--lr', type=float, default=1e-4,
-                       help='Learning rate')
+    parser.add_argument('--batch_size', type=int, default=128,
+                       help='Batch size (smaller for better generalization)')
+    parser.add_argument('--lr', type=float, default=3e-4,
+                       help='Learning rate (higher with warmup)')
     parser.add_argument('--d_model', type=int, default=256,
                        help='Model dimension')
     parser.add_argument('--nhead', type=int, default=8,
                        help='Number of attention heads')
     parser.add_argument('--num_layers', type=int, default=6,
                        help='Number of transformer layers')
-    parser.add_argument('--max_seq_len', type=int, default=256,
-                       help='Maximum sequence length')
-    parser.add_argument('--dropout', type=float, default=0.1,
-                       help='Dropout rate')
-    parser.add_argument('--grad_accum_steps', type=int, default=1,
+    parser.add_argument('--max_seq_len', type=int, default=128,
+                       help='Maximum sequence length (shorter = more focused on early game)')
+    parser.add_argument('--dropout', type=float, default=0.15,
+                       help='Dropout rate (slightly higher for regularization)')
+    parser.add_argument('--grad_accum_steps', type=int, default=2,
                        help='Gradient accumulation steps')
-    parser.add_argument('--teacher_forcing_ratio', type=float, default=0.5,
-                       help='Teacher forcing ratio')
-    parser.add_argument('--val_split', type=float, default=0.2,
+    parser.add_argument('--teacher_forcing_ratio', type=float, default=1.0,
+                       help='Teacher forcing ratio (1.0 = always use teacher forcing for stable training)')
+    parser.add_argument('--val_split', type=float, default=0.15,
                        help='Validation split ratio')
-    parser.add_argument('--label_smoothing', type=float, default=0.1,
-                       help='Label smoothing factor (default: 0.1)')
+    parser.add_argument('--label_smoothing', type=float, default=0.05,
+                       help='Label smoothing factor (lower to not hurt accuracy)')
     parser.add_argument('--seed', type=int, default=42,
                        help='Random seed')
+    parser.add_argument('--warmup_epochs', type=int, default=5,
+                       help='Number of warmup epochs for learning rate')
     
     # WandB arguments
     parser.add_argument('--wandb_entity', type=str, default=None,
@@ -913,16 +1059,25 @@ def main():
     optimizer = torch.optim.AdamW(
         model.parameters(),
         lr=args.lr,
-        weight_decay=0.01
+        weight_decay=0.05,  # Stronger regularization
+        betas=(0.9, 0.98),  # Standard transformer betas
+        eps=1e-8
     )
     
-    # Create learning rate scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer,
-        mode='min',
-        factor=0.5,
-        patience=5
-    )
+    # Calculate total training steps for scheduler
+    total_steps = len(train_loader) * args.epochs // args.grad_accum_steps
+    warmup_steps = len(train_loader) * args.warmup_epochs // args.grad_accum_steps
+    
+    # Create learning rate scheduler with warmup and cosine decay
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            # Linear warmup
+            return float(current_step) / float(max(1, warmup_steps))
+        # Cosine decay after warmup
+        progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+        return max(0.1, 0.5 * (1.0 + math.cos(math.pi * progress)))  # Min LR = 10% of max
+    
+    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
     
     # Create trainer with civ-entity mask and class weights
     trainer = SequencePredictorTrainer(
@@ -940,7 +1095,7 @@ def main():
     if not args.no_wandb:
         wb_cfg = {
             'learning_rate': args.lr,
-            'architecture': 'SequencePredictor',
+            'architecture': 'CausalSequencePredictor',
             'dataset': os.path.basename(args.csv_path),
             'epochs': args.epochs,
             'batch_size': args.batch_size,
@@ -954,7 +1109,12 @@ def main():
             'val_split': args.val_split,
             'entity_vocab_size': len(entity_vocab),
             'civ_vocab_size': len(civ_vocab),
-            'map_vocab_size': len(map_vocab)
+            'map_vocab_size': len(map_vocab),
+            'warmup_epochs': args.warmup_epochs,
+            'label_smoothing': args.label_smoothing,
+            'weight_decay': 0.05,
+            'total_params': sum(p.numel() for p in model.parameters()),
+            'causal_attention': True,  # Key improvement
         }
         
         try:
@@ -974,7 +1134,8 @@ def main():
     print("Starting training...")
     best_val_loss = float('inf')
     patience_counter = 0
-    patience = 10  # Early stopping patience
+    patience = 15  # Early stopping patience (increased for longer training)
+    global_step = 0
     
     for epoch in range(args.epochs):
         print(f"\n{'='*50}")
@@ -994,18 +1155,24 @@ def main():
             
             train_losses.append(loss_dict['loss'])
             
+            # Step scheduler after each optimizer step
+            if (batch_idx + 1) % args.grad_accum_steps == 0:
+                scheduler.step()
+                global_step += 1
+            
             # Log step-level training loss to W&B
-            global_step = epoch * len(train_loader) + batch_idx
             if not args.no_wandb:
                 wandb.log({
                     'step': global_step,
                     'train_step/loss': loss_dict['loss'],
+                    'train_step/lr': optimizer.param_groups[0]['lr'],
                 }, step=global_step)
             
             # Log batch progress
-            if (batch_idx + 1) % 10 == 0:
+            if (batch_idx + 1) % 50 == 0:
+                current_lr = optimizer.param_groups[0]['lr']
                 print(f"  Batch {batch_idx + 1}/{len(train_loader)}, "
-                      f"Loss: {loss_dict['loss']:.4f}")
+                      f"Loss: {loss_dict['loss']:.4f}, LR: {current_lr:.6f}")
         
         # Calculate training metrics
         avg_train_loss = np.mean(train_losses)
@@ -1020,9 +1187,9 @@ def main():
         print(f"\nValidation Results:")
         print(f"  Loss: {val_metrics['loss']:.4f}")
         print(f"  Entity Accuracy: {val_metrics['entity_accuracy']:.4f}")
+        print(f"  Top-5 Accuracy: {val_metrics['entity_top5_accuracy']:.4f}")
         
-        # Update learning rate
-        scheduler.step(val_metrics['loss'])
+        # Get current learning rate
         current_lr = optimizer.param_groups[0]['lr']
         print(f"  Learning Rate: {current_lr:.6f}")
         
@@ -1071,6 +1238,7 @@ def main():
                 # Validation metrics
                 'val/loss': val_metrics['loss'],
                 'val/entity_accuracy': val_metrics['entity_accuracy'],
+                'val/entity_top5_accuracy': val_metrics['entity_top5_accuracy'],
                 # Training dynamics
                 'training/learning_rate': current_lr,
                 'training/grad_norm': total_norm,
@@ -1212,48 +1380,28 @@ def build_vocabularies(csv_path: str, filter_events: List[str] = None,
 
 def compute_entity_class_weights(csv_path: str, entity_vocab: Dict[str, int], 
                                   filter_events: List[str] = None,
-                                  filter_entities: List[str] = None,
-                                  smoothing: float = 0.05,
-                                  high_importance_entities: List[str] = None,
-                                  importance_boost: float = 5.0,
-                                  low_importance_entities: List[str] = None,
-                                  penalty_factor: float = 0.2) -> torch.Tensor:
-    """Compute inverse frequency class weights for entity loss.
+                                  filter_entities: List[str] = None) -> torch.Tensor:
+    """Compute tiered class weights for entity loss with strategic importance.
     
-    Uses smoothed inverse frequency: weight = 1 / (count + smoothing * max_count)
-    Then normalizes so mean weight = 1.0
+    This function uses a tiered weighting approach that balances:
+    1. Routine entities (Villager, House, Farm, Wall) - need high accuracy, moderate weight
+    2. Strategic timing-critical entities (Age-ups, early military) - boosted weight
+    3. Standard entities - use log-dampened inverse frequency
+    4. Very rare entities - capped to prevent over-emphasis on noise
     
-    Additionally applies an importance boost multiplier to strategically important
-    entities like age-up events.
+    The approach avoids pure inverse frequency which would over-penalize common 
+    entities that we MUST predict correctly (Villagers are 24% of all events).
     
     Args:
         csv_path: Path to CSV file
         entity_vocab: Entity vocabulary (token -> id)
         filter_events: List of event types to EXCLUDE
         filter_entities: List of entity names to EXCLUDE (e.g., ['Sheep'])
-        smoothing: Smoothing factor to prevent extreme weights for rare classes
-        high_importance_entities: List of entity names that should receive extra weight
-                                  (default: age-up entities)
-        importance_boost: Multiplier for high importance entities (default: 5.0)
-        low_importance_entities: List of entity names that should receive reduced weight
-                                 (default: ['House'])
-        penalty_factor: Multiplier for low importance entities (default: 0.2)
         
     Returns:
         weights: (vocab_size,) tensor of class weights
     """
     import pandas as pd
-    
-    # Default high-importance entities: age-up events are critical strategic decisions
-    if high_importance_entities is None:
-        high_importance_entities = [
-            'Age Display Persistent 2',  # Age up to Feudal
-            'Age Display Persistent 3',  # Age up to Castle  
-            'Age Display Persistent 4',  # Age up to Imperial
-        ]
-        
-    if low_importance_entities is None:
-        low_importance_entities = ['House']
     
     df = pd.read_csv(csv_path)
     
@@ -1271,78 +1419,171 @@ def compute_entity_class_weights(csv_path: str, entity_vocab: Dict[str, int],
     
     # Count entity frequencies
     entity_counts = df['entity'].astype(str).value_counts()
+    total_count = entity_counts.sum()
     
-    # Create weight tensor
+    # === Define Entity Categories ===
+    
+    # Tier 1: High-frequency routine entities - MUST predict correctly
+    # These are the backbone of every game, penalizing them too much hurts accuracy
+    routine_entities = {
+        'Villager': 1.0,        # Most common - base weight
+        'Gilded Villager': 1.0,
+        'Wheat Field': 1.0,     # Farms
+        'Palisade Wall': 0.8,   # Walls are common but less strategic
+        'Stone Wall': 0.8,
+        'House': 0.6,           # Houses are predictable, less weight needed
+        'Lumber Camp': 1.2,     # Resource buildings matter for build order
+        'Gold Mining Camp': 1.2,
+        'Gristmill': 1.2,
+        'Farmhouse': 1.2,
+    }
+    
+    # Tier 2: Strategic timing-critical entities - boost significantly
+    # These mark key strategic decisions and transitions
+    strategic_entities = {
+        # Age-ups are THE most critical timing decisions
+        'Age Display Persistent 2': 8.0,  # Feudal timing
+        'Age Display Persistent 3': 10.0, # Castle timing - game-defining
+        'Age Display Persistent 4': 12.0, # Imperial timing
+        
+        # Military production buildings - timing of first building matters
+        'Barracks': 3.0,
+        'Archery Range': 3.0,
+        'Stable': 4.0,          # Stable timing often signals knight play
+        'Siege Workshop': 5.0,  # Late game transition
+        
+        # Economic/Tech buildings with strategic timing
+        'Blacksmith': 3.0,      # Upgrade timing matters
+        'University': 4.0,      # Castle age tech
+        'Town Center': 5.0,     # TC timing is strategic (boom vs aggression)
+        'Keep': 4.0,
+        'Castle': 5.0,
+        
+        # Early-age military units (rare but timing-critical)
+        'Knight 2': 6.0,        # Feudal knights are rare and strategic
+        'Manatarms 2': 5.0,     # Early MAA rush
+        'Crossbowman 2': 4.0,   # Early crossbow
+        'Lancer 2': 5.0,        # Early lancer
+        
+        # Age 3/4 power units (less rare but still strategic)
+        'Knight 3': 2.5,
+        'Knight 4': 3.0,
+        'Manatarms 3': 2.0,
+        'Manatarms 4': 2.5,
+    }
+    
+    # Tier 3: Low-priority entities - reduce weight
+    low_priority_entities = {
+        'Outpost': 0.5,  # Common but not strategic
+    }
+    
+    # === Compute Base Weights Using Log-Dampened Inverse Frequency ===
+    # log-dampening prevents extreme weights for rare entities
+    # Formula: weight = log(total_count / count) / log(total_count / median_count)
+    
     vocab_size = len(entity_vocab)
     weights = torch.ones(vocab_size)
     
-    # Get max count for smoothing
-    max_count = entity_counts.max()
+    median_count = entity_counts.median()
     
-    # Compute inverse frequency weights
     for entity_name, entity_id in entity_vocab.items():
-        if entity_name in ('<PAD>', '<UNK>'):
+        if entity_name in ('<PAD>', '<UNK>', '<BOS>'):
             weights[entity_id] = 0.0  # Ignore special tokens
         elif entity_name in entity_counts.index:
             count = entity_counts[entity_name]
-            # Smoothed inverse frequency
-            weights[entity_id] = 1.0 / (count + smoothing * max_count)
+            
+            # Log-dampened inverse frequency (smoother than pure inverse)
+            # This gives more balanced weights across the frequency spectrum
+            log_weight = np.log1p(total_count / count) / np.log1p(total_count / median_count)
+            weights[entity_id] = log_weight
         else:
             weights[entity_id] = 1.0  # Default weight for unseen entities
     
-    # Normalize so mean weight (excluding special tokens) = 1.0
+    # === Apply Tiered Category Multipliers ===
+    
+    applied_weights = {'routine': [], 'strategic': [], 'low_priority': []}
+    
+    for entity_name, multiplier in routine_entities.items():
+        if entity_name in entity_vocab:
+            entity_id = entity_vocab[entity_name]
+            old_weight = weights[entity_id].item()
+            weights[entity_id] = weights[entity_id] * multiplier
+            applied_weights['routine'].append((entity_name, old_weight, weights[entity_id].item()))
+    
+    for entity_name, multiplier in strategic_entities.items():
+        if entity_name in entity_vocab:
+            entity_id = entity_vocab[entity_name]
+            old_weight = weights[entity_id].item()
+            weights[entity_id] = weights[entity_id] * multiplier
+            applied_weights['strategic'].append((entity_name, old_weight, weights[entity_id].item()))
+    
+    for entity_name, multiplier in low_priority_entities.items():
+        if entity_name in entity_vocab:
+            entity_id = entity_vocab[entity_name]
+            old_weight = weights[entity_id].item()
+            weights[entity_id] = weights[entity_id] * multiplier
+            applied_weights['low_priority'].append((entity_name, old_weight, weights[entity_id].item()))
+    
+    # === Cap Extreme Weights ===
+    # Very rare entities shouldn't dominate the loss
+    valid_mask = weights > 0
+    if valid_mask.sum() > 0:
+        # Cap at 99th percentile to prevent outlier domination
+        cap_value = torch.quantile(weights[valid_mask], 0.99).item()
+        weights = torch.clamp(weights, max=cap_value * 1.5)  # Allow strategic boost above cap
+    
+    # === Normalize to Mean = 1.0 ===
     valid_mask = weights > 0
     if valid_mask.sum() > 0:
         mean_weight = weights[valid_mask].mean()
         weights[valid_mask] = weights[valid_mask] / mean_weight
     
-    # Apply importance boost to high-importance entities AFTER normalization
-    boosted_entities = []
-    for entity_name in high_importance_entities:
-        if entity_name in entity_vocab:
-            entity_id = entity_vocab[entity_name]
-            old_weight = weights[entity_id].item()
-            weights[entity_id] = weights[entity_id] * importance_boost
-            boosted_entities.append((entity_name, old_weight, weights[entity_id].item()))
-            
-    # Apply penalty to low-importance entities
-    penalized_entities = []
-    for entity_name in low_importance_entities:
-        if entity_name in entity_vocab:
-            entity_id = entity_vocab[entity_name]
-            old_weight = weights[entity_id].item()
-            weights[entity_id] = weights[entity_id] * penalty_factor
-            penalized_entities.append((entity_name, old_weight, weights[entity_id].item()))
-    
-    # Print summary
-    print(f"Entity class weights computed:")
+    # === Print Detailed Summary ===
+    print(f"\n{'='*60}")
+    print(f"Entity Class Weights Summary (Tiered Strategic Weighting)")
+    print(f"{'='*60}")
+    print(f"  Total entities: {len(entity_counts)}")
     print(f"  Min weight: {weights[valid_mask].min():.4f}")
     print(f"  Max weight: {weights[valid_mask].max():.4f}")
     print(f"  Mean weight: {weights[valid_mask].mean():.4f}")
+    print(f"  Median weight: {torch.median(weights[valid_mask]):.4f}")
     
-    # Show weights for common entities
+    # Show weight distribution by category
     inv_vocab = {v: k for k, v in entity_vocab.items()}
     weight_list = [(inv_vocab[i], weights[i].item()) for i in range(vocab_size) if weights[i] > 0]
     weight_list.sort(key=lambda x: x[1])
     
-    print(f"  Lowest weights (most common):")
-    for name, w in weight_list[:5]:
-        print(f"    {name}: {w:.4f}")
-    print(f"  Highest weights (least common):")
-    for name, w in weight_list[-5:]:
-        print(f"    {name}: {w:.4f}")
+    print(f"\n  Lowest weights (high-frequency entities):")
+    for name, w in weight_list[:8]:
+        count = entity_counts.get(name, 0)
+        print(f"    {name}: {w:.4f} (count: {count:,})")
     
-    # Print boosted entities
-    if boosted_entities:
-        print(f"\n  High-importance entities (boosted by {importance_boost}x):")
-        for name, old_w, new_w in boosted_entities:
+    print(f"\n  Highest weights (strategic/rare entities):")
+    for name, w in weight_list[-8:]:
+        count = entity_counts.get(name, 0)
+        print(f"    {name}: {w:.4f} (count: {count:,})")
+    
+    # Print category summaries
+    if applied_weights['routine']:
+        print(f"\n  Routine entities (accuracy-critical):")
+        for name, old_w, new_w in sorted(applied_weights['routine'], key=lambda x: -x[2])[:5]:
+            print(f"    {name}: {new_w:.4f}")
+    
+    if applied_weights['strategic']:
+        print(f"\n  Strategic entities (timing-critical, boosted):")
+        for name, old_w, new_w in sorted(applied_weights['strategic'], key=lambda x: -x[2])[:10]:
             print(f"    {name}: {old_w:.4f} -> {new_w:.4f}")
-
-    # Print penalized entities
-    if penalized_entities:
-        print(f"\n  Low-importance entities (penalized by {penalty_factor}x):")
-        for name, old_w, new_w in penalized_entities:
-            print(f"    {name}: {old_w:.4f} -> {new_w:.4f}")
+    
+    # Show key ratios
+    villager_weight = weights[entity_vocab.get('Villager', 0)].item() if 'Villager' in entity_vocab else 0
+    knight2_weight = weights[entity_vocab.get('Knight 2', 0)].item() if 'Knight 2' in entity_vocab else 0
+    age3_weight = weights[entity_vocab.get('Age Display Persistent 3', 0)].item() if 'Age Display Persistent 3' in entity_vocab else 0
+    
+    print(f"\n  Key Weight Ratios:")
+    print(f"    Villager: {villager_weight:.4f}")
+    print(f"    Knight 2 / Villager: {knight2_weight / max(villager_weight, 0.001):.2f}x")
+    print(f"    Age-up Castle / Villager: {age3_weight / max(villager_weight, 0.001):.2f}x")
+    print(f"{'='*60}\n")
     
     return weights
 
