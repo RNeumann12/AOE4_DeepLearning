@@ -2,8 +2,13 @@
 Train BuildOrderGenerator from sequences using supervised teacher forcing.
 
 Usage:
-  python BuildOrderPrediction/BuildOrderPrediction_train.py --csv transformer_input.csv --epochs 50 --batch_size 64 --device cuda --truncation_strategy head --max_len 128
-
+  python BuildOrderPrediction/BuildOrderPrediction_train.py --csv input_with_map.csv --epochs 50 --truncation_strategy head --max_len 128
+python BuildOrderPrediction/BuildOrderPrediction_train.py \
+  --csv transformer_input_new.csv \
+  --epochs 50 \
+  --label_smoothing 0.15 \
+  --truncation_strategy head \
+  --max_len 256
   """
 import argparse
 import os
@@ -60,11 +65,28 @@ def build_civ_entity_mask(dataset, entity_vocab, num_civs):
     return mask
 
 
-def evaluate(trainer, dataloader, device):
+def evaluate(trainer, dataloader, device, teacher_forcing_ratio=1.0):
+    """Evaluate the model.
+    
+    Args:
+        trainer: BuildOrderTrainer instance
+        dataloader: validation data loader
+        device: torch device
+        teacher_forcing_ratio: ratio of teacher forcing to use.
+            - 1.0 = full teacher forcing (matches training metrics)
+            - 0.0 = autoregressive generation (measures real inference quality)
+    """
     trainer.model.eval()
     losses = []
     win_preds = []
     win_trues = []
+    
+    # Entity accuracy tracking
+    total_correct_entity = 0
+    total_correct_top3 = 0
+    total_correct_top5 = 0
+    total_correct_top10 = 0
+    total_samples = 0
 
     with torch.no_grad():
         for batch in dataloader:
@@ -83,12 +105,44 @@ def evaluate(trainer, dataloader, device):
                 enemy_civ=batch['enemy_civ'],
                 target_sequence_length=batch['entity_ids'].size(1),
                 target_win_prob=None, # batch.get('labels', None) -> not used during eval to prevent leakage
-                teacher_forcing_ratio=1.0,  # use teacher forcing for supervised loss
+                teacher_forcing_ratio=teacher_forcing_ratio,  # configurable teacher forcing
                 ground_truth=(batch['entity_ids'], batch['event_ids'], batch['times']),
                 allowed_entities_mask=allowed
             )
             loss, _ = trainer.compute_loss(preds, (batch['entity_ids'], batch['event_ids'], batch['times']), preds[-1], batch.get('labels', None))
             losses.append(loss.item())
+
+            # Entity accuracy calculation
+            entity_logits = preds[0]  # (batch, seq_len, vocab_size_entity)
+            target_entities = batch['entity_ids']  # (batch, seq_len)
+            
+            # Flatten for accuracy calculation (ignore padding if present)
+            batch_size, seq_len = target_entities.shape
+            for b in range(batch_size):
+                for s in range(seq_len):
+                    target_id = target_entities[b, s].item()
+                    if target_id == 0:  # skip padding
+                        continue
+                    
+                    logits_step = entity_logits[b, s]  # (vocab_size)
+                    
+                    # Top-1 accuracy
+                    top1_pred = logits_step.argmax().item()
+                    if top1_pred == target_id:
+                        total_correct_entity += 1
+                    
+                    # Top-k accuracies
+                    topk_values, topk_indices = torch.topk(logits_step, min(10, logits_step.size(0)))
+                    topk_list = topk_indices.tolist()
+                    
+                    if target_id in topk_list[:3]:
+                        total_correct_top3 += 1
+                    if target_id in topk_list[:5]:
+                        total_correct_top5 += 1
+                    if target_id in topk_list[:10]:
+                        total_correct_top10 += 1
+                    
+                    total_samples += 1
 
             # collect win predictions for metric calculation
             if 'labels' in batch and batch['labels'] is not None:
@@ -98,6 +152,13 @@ def evaluate(trainer, dataloader, device):
                 win_trues.extend(batch['labels'].cpu().numpy().tolist())
 
     avg_loss = float(np.mean(losses)) if losses else float('nan')
+    
+    # Calculate entity accuracies
+    entity_accuracy = total_correct_entity / total_samples if total_samples > 0 else float('nan')
+    entity_top3_accuracy = total_correct_top3 / total_samples if total_samples > 0 else float('nan')
+    entity_top5_accuracy = total_correct_top5 / total_samples if total_samples > 0 else float('nan')
+    entity_top10_accuracy = total_correct_top10 / total_samples if total_samples > 0 else float('nan')
+    
     try:
         from sklearn.metrics import roc_auc_score, accuracy_score
         auc = roc_auc_score(win_trues, win_preds) if len(win_trues) > 0 else float('nan')
@@ -106,7 +167,7 @@ def evaluate(trainer, dataloader, device):
         auc = float('nan')
         acc = float('nan')
 
-    return avg_loss, auc, acc
+    return avg_loss, auc, acc, entity_accuracy, entity_top3_accuracy, entity_top5_accuracy, entity_top10_accuracy
 
 
 def main(args):
@@ -123,17 +184,23 @@ def main(args):
             print(f"Warning: failed to initialize wandb: {e}. Continuing without W&B.")
             run = None
 
+    # Exclude DESTROY events - we only care about BUILD/FINISH for build orders
+    filter_events = ['DESTROY']
+    # Exclude Sheep - they are captured units, not built, so no strategy involved
+    filter_entities = ['Sheep']
+    
     print('Building vocabs...')
     import pandas as pd
     df = pd.read_csv(args.csv)
-    vocabs = build_vocabs(df)
+    vocabs = build_vocabs(df, filter_events=filter_events, filter_entities=filter_entities)
 
     print('Creating dataset...')
     grouped = df.groupby(['game_id', 'profile_id']).size()
     dataset_longest = int(grouped.max()) if len(grouped) > 0 else 0
     desired_max_len = args.max_len if args.max_len is not None else min(dataset_longest, args.max_pos_embed_cap)
 
-    dataset = AoEEventDataset(args.csv, vocabs['entity_vocab'], vocabs['event_vocab'], vocabs['civ_vocab'], vocabs['map_vocab'], max_len=desired_max_len, truncation_strategy=args.truncation_strategy)
+    dataset = AoEEventDataset(args.csv, vocabs['entity_vocab'], vocabs['event_vocab'], vocabs['civ_vocab'], vocabs['map_vocab'], max_len=desired_max_len, truncation_strategy=args.truncation_strategy,
+                              filter_events=filter_events, filter_entities=filter_entities)
 
     model_max_len = desired_max_len if desired_max_len > 0 else 1
 
@@ -172,7 +239,7 @@ def main(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     trainer = BuildOrderTrainer(model, optimizer, device=device, use_amp=args.use_amp, grad_accum_steps=args.grad_accum_steps,
-                                reward_model=reward_model)
+                                reward_model=reward_model, label_smoothing=args.label_smoothing)
     best_val_loss = float('inf')
     remediation_attempts = 0
     max_remediations = 3
@@ -241,11 +308,24 @@ def main(args):
             # retry same epoch with modified settings
             continue
 
-        val_loss, val_auc, val_acc = evaluate(trainer, val_loader, device)
+        # Teacher-forcing evaluation (matches training metrics)
+        val_loss, val_auc, val_acc, entity_acc, entity_top3, entity_top5, entity_top10 = evaluate(trainer, val_loader, device, teacher_forcing_ratio=1.0)
         print(f'Epoch {epoch}: train_loss={float(np.mean(epoch_losses)):.4f} val_loss={val_loss:.4f} val_auc={val_auc:.4f} val_acc={val_acc:.4f}')
+        print(f'  Entity Acc (TF): top1={entity_acc:.4f} top3={entity_top3:.4f} top5={entity_top5:.4f} top10={entity_top10:.4f}')
+        
+        # Autoregressive evaluation (measures real generation quality) - every 5 epochs
+        if epoch % 5 == 0 or epoch == args.epochs:
+            ar_loss, ar_auc, ar_acc, ar_entity_acc, ar_top3, ar_top5, ar_top10 = evaluate(trainer, val_loader, device, teacher_forcing_ratio=0.0)
+            print(f'  Entity Acc (AR): top1={ar_entity_acc:.4f} top3={ar_top3:.4f} top5={ar_top5:.4f} top10={ar_top10:.4f}')
+        else:
+            ar_entity_acc = ar_top3 = ar_top5 = ar_top10 = float('nan')
 
         if run is not None:
-            run.log({'epoch': epoch, 'train_loss': float(np.mean(epoch_losses)), 'val_loss': val_loss, 'val_auc': val_auc, 'val_acc': val_acc, 'teacher_forcing': current_tf})
+            log_dict = {'epoch': epoch, 'train_loss': float(np.mean(epoch_losses)), 'val_loss': val_loss, 'val_auc': val_auc, 'val_acc': val_acc, 'teacher_forcing': current_tf,
+                     'entity_accuracy': entity_acc, 'entity_top3_accuracy': entity_top3, 'entity_top5_accuracy': entity_top5, 'entity_top10_accuracy': entity_top10}
+            if not np.isnan(ar_entity_acc):
+                log_dict.update({'ar_entity_accuracy': ar_entity_acc, 'ar_entity_top3': ar_top3, 'ar_entity_top5': ar_top5, 'ar_entity_top10': ar_top10})
+            run.log(log_dict)
 
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -285,6 +365,7 @@ if __name__ == '__main__':
     parser.add_argument('--truncation_strategy', choices=['head','tail','head_tail'], default='head_tail')
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of steps to accumulate gradients before stepping optimizer')
     parser.add_argument('--use_amp', action='store_true', default=True, help='Use automatic mixed precision (AMP) to reduce memory')
+    parser.add_argument('--label_smoothing', type=float, default=0.1, help='Label smoothing factor to prevent overconfidence on common classes like Villager')
     parser.add_argument('--use_wandb', dest='use_wandb', action='store_true', default=True, help='Enable Weights & Biases logging')
     parser.add_argument('--no-wandb', dest='use_wandb', action='store_false', help='Disable Weights & Biases logging')
     parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity/username')

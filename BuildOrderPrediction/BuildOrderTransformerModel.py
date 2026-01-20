@@ -204,9 +204,10 @@ class BuildOrderGenerator(nn.Module):
         all_time_preds = []
 
         # ============================================
-        # PARALLEL TRAINING MODE (teacher_forcing_ratio == 1.0)
+        # PARALLEL MODE (teacher_forcing_ratio == 1.0 with ground truth)
+        # Used for training AND evaluation with teacher forcing
         # ============================================
-        if self.training and teacher_forcing_ratio == 1.0 and ground_truth is not None:
+        if teacher_forcing_ratio == 1.0 and ground_truth is not None:
             entity_targets, event_targets, time_targets = ground_truth
             seq_len = entity_targets.size(1)
             batch_size = entity_targets.size(0)
@@ -238,13 +239,16 @@ class BuildOrderGenerator(nn.Module):
             event_logits = self.event_head(decoder_output)    # (B, L, V)
             time_preds = torch.relu(self.time_head(decoder_output)).squeeze(-1)  # (B, L)
 
+            # Store unmasked logits for loss computation (label smoothing requires all classes accessible)
+            entity_logits_unmasked = entity_logits
+
             # Derive allowed mask if not provided
             if allowed_entities_mask is None and hasattr(self, 'civ_entity_mask') and self.civ_entity_mask is not None:
                 allowed = self.civ_entity_mask[player_civ]
             else:
                 allowed = allowed_entities_mask
 
-            # Apply civ-based mask if provided
+            # Apply civ-based mask if provided (only affects sampling/argmax, not loss)
             if allowed is not None:
                 allowed_b1v = allowed.unsqueeze(1)  # (B, 1, V)
                 entity_logits = entity_logits.masked_fill(~allowed_b1v, self.mask_value)
@@ -253,7 +257,9 @@ class BuildOrderGenerator(nn.Module):
             final_output = decoder_output[:, -1, :]
             win_logits = self.win_prob_head(final_output).squeeze(-1)
 
-            return entity_logits, event_logits, time_preds, win_logits
+            # Return unmasked logits for training loss, masked logits would cause label smoothing issues
+            # (masked classes get -1e4 logits -> softmax ~= 0 -> log(0) in smoothed loss = inf)
+            return entity_logits_unmasked, event_logits, time_preds, win_logits
 
         # Generate sequence autoregressively
         for step in range(target_sequence_length):
@@ -285,6 +291,12 @@ class BuildOrderGenerator(nn.Module):
             event_logits = self.event_head(last_output)    # (B, 1, vocab_size_event)
             time_delta = torch.nn.functional.softplus(self.time_head(last_output)).squeeze(-1)
 
+            # Store UNMASKED logits for loss computation (label smoothing requires all classes accessible)
+            # Masking with -1e4 values causes label smoothing to produce huge losses
+            all_entity_logits.append(entity_logits)
+            all_event_logits.append(event_logits)
+            all_time_preds.append(time_delta)
+
             # Derive allowed mask if not provided
             if allowed_entities_mask is None and hasattr(self, 'civ_entity_mask') and self.civ_entity_mask is not None:
                 # civ_entity_mask indexed by civ id -> (num_civs, vocab)
@@ -292,27 +304,26 @@ class BuildOrderGenerator(nn.Module):
             else:
                 allowed = allowed_entities_mask
 
-            # Apply mask to entity logits if available (set disallowed logits to a very negative value)
+            # Apply mask to entity logits for sampling only (not stored for loss)
+            entity_logits_masked = entity_logits
             if allowed is not None:
                 # allowed: (B, V) -> expand to (B, 1, V) to match logits
                 allowed_b1v = allowed.unsqueeze(1)
-                entity_logits = entity_logits.masked_fill(~allowed_b1v, self.mask_value)
-
-            # Store logits and preds
-            all_entity_logits.append(entity_logits)
-            all_event_logits.append(event_logits)
-            all_time_preds.append(time_delta)
+                entity_logits_masked = entity_logits.masked_fill(~allowed_b1v, self.mask_value)
             
             # Decide whether to use ground truth or predictions
-            if self.training and ground_truth is not None and torch.rand(1).item() < teacher_forcing_ratio:
+            # Use teacher forcing when: ground truth is available AND random sample < teacher_forcing_ratio
+            # Note: This works in both training and eval mode to allow teacher forcing evaluation
+            use_teacher_forcing = ground_truth is not None and torch.rand(1).item() < teacher_forcing_ratio
+            if use_teacher_forcing:
                 # Teacher forcing: use ground truth
                 next_entity = ground_truth[0][:, step:step+1]  # (B, 1)
                 next_event = ground_truth[1][:, step:step+1]   # (B, 1)
                 next_time = ground_truth[2][:, step:step+1].unsqueeze(-1) if step > 0 else time_delta.unsqueeze(-1)
             else:
                 # Greedy sampling (can be changed to beam search/top-k during inference)
-                # Argmax respects masked logits since disallowed logits are very negative
-                next_entity = torch.argmax(entity_logits, dim=-1)  # (B, 1)
+                # Use masked logits for sampling so disallowed entities are not selected
+                next_entity = torch.argmax(entity_logits_masked, dim=-1)  # (B, 1)
                 next_event = torch.argmax(event_logits, dim=-1)    # (B, 1)
                 next_time = time_delta.unsqueeze(-1)  # (B, 1)
             
@@ -482,7 +493,7 @@ class BuildOrderTrainer:
 
     Supports AMP (automatic mixed precision) and gradient accumulation to reduce memory usage.
     """
-    def __init__(self, model, optimizer, device, use_reinforce=False, reward_model=None, use_amp: bool = False, grad_accum_steps: int = 1):
+    def __init__(self, model, optimizer, device, use_reinforce=False, reward_model=None, use_amp: bool = False, grad_accum_steps: int = 1, label_smoothing: float = 0.1):
         self.model = model
         self.optimizer = optimizer
         self.device = device
@@ -515,32 +526,40 @@ class BuildOrderTrainer:
                     self.scaler = None
         else:
             self.scaler = None
+        
+        # Label smoothing to prevent overconfidence on common classes like Villager
+        self.label_smoothing = label_smoothing
 
         
     def compute_loss(self, predictions, targets, win_probs, target_win_probs=None):
         """
         Compute combined loss for build order generation.
+        
+        Note: CrossEntropyLoss with label_smoothing can have numerical issues under AMP autocast
+        with float16. We cast logits to float32 to ensure correct loss computation.
         """
         entity_logits, event_logits, time_preds, pred_win_probs = predictions
         entity_targets, event_targets, time_targets = targets
         
-        # Classification losses for entity and event
-        entity_loss = nn.CrossEntropyLoss(ignore_index=0)(
-            entity_logits.view(-1, entity_logits.size(-1)),
+        # Classification losses for entity and event with optional label smoothing
+        # Label smoothing helps prevent overconfidence on frequent classes
+        # Cast logits to float32 to avoid numerical issues with label_smoothing under AMP
+        entity_loss = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=self.label_smoothing)(
+            entity_logits.view(-1, entity_logits.size(-1)).float(),
             entity_targets.view(-1)
         )
         
-        event_loss = nn.CrossEntropyLoss(ignore_index=0)(
-            event_logits.view(-1, event_logits.size(-1)),
+        event_loss = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=self.label_smoothing)(
+            event_logits.view(-1, event_logits.size(-1)).float(),
             event_targets.view(-1)
         )
         
-        # Time prediction loss (MSE)
-        time_loss = nn.MSELoss()(time_preds, time_targets)
+        # Time prediction loss (MSE) - also cast to float32 for consistency
+        time_loss = nn.MSELoss()(time_preds.float(), time_targets.float())
         
         # Win probability prediction loss
         if target_win_probs is not None:
-            win_loss = nn.BCEWithLogitsLoss()(pred_win_probs, target_win_probs)
+            win_loss = nn.BCEWithLogitsLoss()(pred_win_probs.float(), target_win_probs.float())
         else:
             win_loss = torch.tensor(0.0, device=self.device)
         
