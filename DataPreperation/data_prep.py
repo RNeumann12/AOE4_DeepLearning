@@ -43,9 +43,16 @@ def process_file(path: str, stats: Dict[str, Dict[str, int]], h2h) -> None:
                 print(f"[INFO] Skipping short game ({dur}s) in {path}:{lineno}")
                 continue
 
+
             game = obj.get("game") or obj  # tolerate either top-level game or whole object
             teams = game.get("teams") or game.get("players") or []
             # Normalize teams -> flat list of player entries
+            
+            leaderboard = game.get('leaderboard')
+            if leaderboard != "rm_solo":
+                print(f"[INFO] Skipping not 1v1 {leaderboard}")
+                continue
+            
             entries = []
             if isinstance(teams, list) and teams and all(isinstance(t, list) for t in teams):
                 # teams is list-of-teams, each team is list of player entries
@@ -283,6 +290,11 @@ def extract_events_from_obj(obj: dict):
     players = summary.get('players') or []
     game_map = summary.get('map_name') or (obj.get('game') or {}).get('map')
 
+    game = obj.get('game')
+    leaderboard = game.get('leaderboard')
+    if leaderboard != "rm_solo":
+        print(f"[INFO] Skipping not 1v1 {leaderboard}")
+        return evs
 
     # fallback: try to find players under top-level game entry
     if not players and 'game' in obj:

@@ -40,6 +40,7 @@ class AoETransformer(nn.Module):
                  vocab_size_entity: int, 
                  vocab_size_event: int, 
                  civ_vocab_size: int, 
+                 map_vocab_size: int, 
                  d_model: int = 128, 
                  nhead: int = 4, 
                  num_layers: int = 3, 
@@ -53,6 +54,7 @@ class AoETransformer(nn.Module):
         self.entity_embed = nn.Embedding(vocab_size_entity, d_model)
         self.event_embed = nn.Embedding(vocab_size_event, d_model)
         self.civ_embed = nn.Embedding(civ_vocab_size, d_model)
+        self.map_embed = nn.Embedding(map_vocab_size, d_model)
         
         # Positional Embeddings
         self.seq_pos_embed = nn.Embedding(max_len, d_model) # Order of events (1st, 2nd, 3rd...)
@@ -82,7 +84,7 @@ class AoETransformer(nn.Module):
             nn.Linear(d_model, 1)
         )
 
-    def forward(self, entity_ids, event_ids, times, attention_mask, player_civ, enemy_civ):
+    def forward(self, entity_ids, event_ids, times, attention_mask, game_map, player_civ, enemy_civ):
 
         """
         Forward pass of the model.
@@ -92,6 +94,7 @@ class AoETransformer(nn.Module):
             event_ids: Tensor of shape (B, L) containing event IDs.
             times: Tensor of shape (B, L) containing time values in seconds.
             attention_mask: Tensor of shape (B, L) containing attention mask.
+            game_map: Tensor of shape (B) containing map IDs.
             player_civ: Tensor of shape (B) containing player civ IDs.
             enemy_civ: Tensor of shape (B) containing enemy civ IDs.
 
@@ -138,6 +141,7 @@ class AoETransformer(nn.Module):
         cls_output = encoded[:, 0, :] # (B, d_model)
 
         # Get Civ Embeddings
+        maps = self.map_embed(game_map) # (B, d_model)
         p_civ = self.civ_embed(player_civ) # (B, d_model)
         e_civ = self.civ_embed(enemy_civ)  # (B, d_model)
 

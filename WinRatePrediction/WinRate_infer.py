@@ -7,6 +7,9 @@ Usage examples:
 import argparse
 import torch
 import pandas as pd
+# Ensure project root is on PYTHONPATH for local imports
+import os, sys
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 from aoe_player_game_datset import build_vocabs, AoEEventDataset, collate_fn
 from WinRatePrediction.WinRateTransformerModel import AoETransformer
 from torch.utils.data import DataLoader
@@ -27,14 +30,14 @@ def main(args):
         if dataset_longest > desired_max_len:
             print(f"Warning: longest sequence in data is {dataset_longest}, capping positional length to {desired_max_len}. Sequences will be truncated per strategy '{args.truncation_strategy}'")
 
-    ds = AoEEventDataset(args.csv, vocabs['entity_vocab'], vocabs['event_vocab'], vocabs['civ_vocab'], max_len=desired_max_len, truncation_strategy=args.truncation_strategy)
+    ds = AoEEventDataset(args.csv, vocabs['entity_vocab'], vocabs['event_vocab'], vocabs['civ_vocab'], vocabs['map_vocab'], max_len=desired_max_len, truncation_strategy=args.truncation_strategy)
     loader = DataLoader(ds, batch_size=args.batch_size, collate_fn=collate_fn)
 
     # If max_len not specified, set model positional embedding size to longest sequence in dataset
     model_max_len = desired_max_len if desired_max_len > 0 else 1
 
     chk = torch.load(args.model, map_location='cpu')
-    model = AoETransformer(vocab_size_entity=len(vocabs['entity_vocab']), vocab_size_event=len(vocabs['event_vocab']), civ_vocab_size=len(vocabs['civ_vocab']), d_model=args.d_model, nhead=args.nhead, num_layers=args.num_layers, dim_feedforward=args.ffn_dim, dropout=args.dropout, max_len=model_max_len)
+    model = AoETransformer(vocab_size_entity=len(vocabs['entity_vocab']), vocab_size_event=len(vocabs['event_vocab']), civ_vocab_size=len(vocabs['civ_vocab']), map_vocab_size=len(vocabs['map_vocab']), d_model=args.d_model, nhead=args.nhead, num_layers=args.num_layers, dim_feedforward=args.ffn_dim, dropout=args.dropout, max_len=model_max_len)
     model.load_state_dict(chk['model_state'])
 
     # Move model to selected device and set eval mode
@@ -56,6 +59,7 @@ def main(args):
                 batch['event_ids'],
                 batch['times'],
                 batch['attention_mask'],
+                batch['map'],
                 player_civ=batch['player_civ'],
                 enemy_civ=batch['enemy_civ']
             )
