@@ -1,0 +1,428 @@
+#!/usr/bin/env python3
+# Simple tool to compute per-civilization winrates from a .jsonl of collected game records.
+import argparse
+from asyncio import events
+import bisect
+from bisect import bisect, bisect_left, bisect_left
+import glob
+from importlib.resources import files
+import json
+import sys
+from time import time
+import pandas as pd
+import seaborn as sns
+import matplotlib.pyplot as plt
+
+import csv
+import math
+from collections import defaultdict
+from typing import Dict
+
+def _phase_from_time(t: int) -> str:
+    """Return phase label for a timestamp (seconds).
+    EARLY: 0 - 8 min (0-480s)
+    MID: 8 - 20 min (480-1200s)
+    LATE: 20+ min (>1200s)
+    """
+    if t is None:
+        return "EARLY"
+    if t < 480:
+        return "EARLY"
+    if t < 1200:
+        return "MID"
+    return "LATE"
+
+def _clean_entity_from_icon(icon: str) -> str:
+    """Extract a human-readable entity name from the `icon` path (e.g. '.../barracks' -> 'Barracks')."""
+    if not icon:
+        return ""
+    name = icon.split('/')[-1]
+    # remove common prefixes and tidy
+    for prefix in ("building_", "unit_", "building", "race_", "icons", "hud", "races"):
+        if name.startswith(prefix):
+            name = name[len(prefix):]
+    name = name.replace('_', ' ').strip()
+    return name.title()
+
+def _game_duration_seconds(obj: dict) -> int | None:
+    """Return game duration in seconds if available, otherwise None.
+
+    Checks (in order): summary.duration, game.duration, (summary.finished_at - summary.started_at)
+    """
+    summary = obj.get('summary') or {}
+    dur = summary.get('duration') or (obj.get('game') or {}).get('duration')
+    if isinstance(dur, (int, float)):
+        try:
+            return int(dur)
+        except Exception:
+            pass
+    # attempt to compute from timestamps if provided (unix seconds)
+    started = summary.get('started_at')
+    finished = summary.get('finished_at')
+    if isinstance(started, (int, float)) and isinstance(finished, (int, float)):
+        try:
+            return int(finished - started)
+        except Exception:
+            pass
+    return None
+
+def _build_resource_snapshots(player: dict):
+    """
+    Returns a dict: profile_id -> list of snapshots sorted by time
+    Each snapshot: {'time': t, 'wood': x, 'food': y, 'gold': z, 'stone': w, ...}
+    """
+    res_data = player.get('resources') or {}
+    times = res_data.get('timestamps') or []
+    if not times:
+        return {}
+
+    snapshots = {}
+    for i, t in enumerate(times):
+        snapshot = {}
+        for key in ['wood', 'food', 'gold', 'stone', 'wood_per_min', 'food_per_min', 'gold_per_min', 'stone_per_min', 'military', 'economy', 'technology', 'society', 'oliveoil', 'oliveoil_per_min']:
+            vals = res_data.get(key) or []
+            snapshot[key] = vals[i] if i < len(vals) else 0
+        snapshots[t] = snapshot
+    
+    return snapshots
+
+def extract_players_from_obj(obj: dict):
+    """Return a list of player dicts extracted from a single game record JSON object."""
+    players = []
+    summary = obj.get('summary') or {}
+    players = summary.get('players') or []
+    if not players and 'game' in obj:
+        teams = obj['game'].get('teams') or obj['game'].get('players') or []
+        entries = []
+        if isinstance(teams, list) and teams and all(isinstance(t, list) for t in teams):
+            for team in teams:
+                entries.extend(team)
+        elif isinstance(teams, list):
+            entries = teams
+        elif isinstance(teams, dict):
+            for v in teams.values():
+                if isinstance(v, list):
+                    entries.extend(v)
+                elif isinstance(v, dict):
+                    entries.append(v)
+        for entry in entries:
+            p = entry.get('player') if 'player' in entry else entry
+            if isinstance(p, dict):
+                players.append(p)
+    return players
+
+def calculate_strat_from_data(build_events: list, resource_data: Dict) -> str:
+    """
+    Determines the strategy label based on a player's early game stats.
+    Returns one of: turtle, eco, fast_castle, early_aggression, late_aggression
+    """
+
+    # Early game: first 180 seconds
+    early_resources =  {k: v for k, v in resource_data.items() if k <= 180}
+    late_resources =  {k: v for k, v in resource_data.items() if k > 180 and k <= 600}
+    
+    # Sum resources collected in early game
+    early_wood_mean = sum(entry["wood_per_min"] for entry in early_resources.values()) / len(early_resources)
+    early_food_mean = sum(entry["food_per_min"] for entry in early_resources.values()) / len(early_resources)
+    early_gold_mean = sum(entry["gold_per_min"] for entry in early_resources.values()) / len(early_resources)
+    early_stone_mean = sum(entry["stone_per_min"] for entry in early_resources.values())  / len(early_resources) 
+
+    total_res_mean = early_wood_mean + early_food_mean + early_gold_mean + early_stone_mean
+    
+    count_early = len(early_resources) or 1
+    count_late = len(late_resources) or 1
+
+    # Sum military produced in early game
+    early_military = sum(entry["military"] for entry in early_resources.values()) / count_early
+    late_military = sum(entry["military"] for entry in late_resources.values()) / count_late
+
+    early_eco = sum(entry["economy"] for entry in early_resources.values()) / count_early
+    late_eco = sum(entry["economy"] for entry in late_resources.values()) / count_late
+
+    villager_count = 0
+    for item in build_events:
+        icon = item.get('icon') or ''
+        entity = _clean_entity_from_icon(icon)
+
+        if entity != 'Villager':
+            continue
+
+        villager_count = sum(x for x in item.get('finished') if x <= 180)
+
+    # Heuristics for strategies
+    if early_military <= 5 and total_res_mean >= 300:
+        return "eco"  # focus on economy, low military
+    elif early_military <= 2 and villager_count >= 30:
+        return "fast_castle"  # builds fast economy to reach Castle Age
+    elif early_military >= 20 and early_military > early_eco * 0.4:
+        return "early_aggression"
+    elif  early_military <= 10 and late_military >= 30 and late_military > late_eco * 0.3:
+        return "late_aggression"
+    elif early_stone_mean >= 50 and early_military <= 3:
+        return "turtle"  # heavy defensive building
+    else:
+        return "unknown"  # default fallback
+
+
+def extract_events_from_obj(obj: dict):
+    """Return a list of event dicts extracted from a single game record JSON object.
+
+    Each event: {game_id, profile_id, time (s), event (BUILD/FINISH/DESTROY/UNKNOWN), entity, map, player_civ, enemy_civ}
+    """
+    evs = []
+    # Get all needed data from obj
+    summary = obj.get('summary') or {}
+    game_id = summary.get('game_id') or (obj.get('game') or {}).get('game_id')
+    game_map = summary.get('map_name') or (obj.get('game') or {}).get('map')
+    game = obj.get('game')
+    leaderboard = game.get('leaderboard')
+    
+    # Validation if needed data is missing
+    if summary is None:
+        print("[WARN] no summary found")
+        return evs
+
+    if leaderboard != "rm_solo":
+        print(f"[INFO] Skipping not 1v1 {leaderboard}")
+        return evs
+
+     # filter short games when duration is available
+    dur = _game_duration_seconds(obj)
+    if dur is not None and dur < 120:
+        print(f"[INFO] Skipping short game ({dur}s) with game_id={game_id}")
+        return evs
+        
+    # fallback: try to find players under top-level game entry
+    players = extract_players_from_obj(obj)
+
+    if not players:
+        print(f"[WARN] no players found for game_id={game_id}")
+        return evs
+    
+    if len(players) != 2:
+        print(f"[WARN] unequal to 2 players found for game_id={game_id}; skipping")
+        return evs
+    
+    game = {}
+    game_data = {}
+    for p in players:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get('profile_id') or p.get('profileId')
+
+        civ = p.get('civilization') or p.get('civilisation') or p.get('civilization_attrib') or ''
+        if civ is not None:
+            civ = str(civ).lower()
+
+        game_data[pid] = {
+            'civ': civ,
+            'team': p.get('team') or p.get('team_id') or None,
+        }
+    
+    for player in players:
+
+        if not isinstance(player, dict):
+            continue
+
+        profile_id = player.get('profile_id') or player.get('profileId')
+        player_civ = game_data[profile_id]['civ']
+
+        # Calculate enemy civilizations
+        enemy_civs = set()
+        for pid, data in game_data.items():
+            if pid == profile_id:
+                continue
+            team_p = game_data[pid].get('team')
+            team_self = game_data[profile_id].get('team')
+            if team_p is not None and team_self is not None:
+                if team_p != team_self and data['civ']:
+                    enemy_civs.add(data['civ'])
+            else:
+                # no team info, assume other players are opponents
+                if data['civ']:
+                    enemy_civs.add(data['civ'])
+        enemy_civs = sorted(enemy_civs)
+        enemy_civs = ';'.join(enemy_civs)
+
+        game['enemy_civ'] = enemy_civs
+
+        
+        result = p.get('result') or p.get('outcome')
+        if result is not None and isinstance(result, str):
+            res_norm = result.strip().lower()
+        else:
+            res_norm = ''
+
+        won_flag = res_norm in ('win', 'won', 'victory')
+        
+
+        resource_snapshot = _build_resource_snapshots(player)
+
+        if resource_snapshot is None or not resource_snapshot:
+            print("[WARN] no resource found")
+            return []
+        
+        
+        
+        build_order = player.get('build_order') or player.get('buildOrder') or []
+        if not isinstance(build_order, list):
+            continue
+
+        events = []
+        for item in build_order:
+            icon = item.get('icon') or ''
+            entity = _clean_entity_from_icon(icon)
+
+            if entity == 'Villager':
+                continue
+
+            # types to map => event name
+            for key, name in (('constructed', 'BUILD'), ('finished', 'FINISH'), ('destroyed', 'DESTROY')):  
+                for t in item.get(key) or []:
+                    events.append({
+                        'event': name,
+                        'entity': entity,
+                        'type': item.get('type') or 'unknown',
+                        'time': t,
+                    })
+
+        last_time = 0
+        data_row = []
+        strat_label = ''
+        for time, snap_shot in resource_snapshot.items(): 
+            resource_data = snap_shot.copy()
+            meta_data = {
+                'game_id': game_id,
+                'profile_id': profile_id,
+                'player_civ': player_civ,
+                'enemy_civ': enemy_civs,
+                'map': game_map,
+                'player_result': res_norm,
+                'player_won': 1 if won_flag else 0,
+            }
+
+            num_finished = 0
+            num_destroyed = 0
+            for item in build_order:
+                icon = item.get('icon') or ''
+                entity = _clean_entity_from_icon(icon)
+
+                if entity != 'Villager':
+                    continue
+
+                from bisect import bisect_right, bisect_left
+                num_finished = bisect_right(item.get('finished'), time) - bisect_left(item.get('finished'), last_time) or 0
+                num_destroyed = bisect_right(item.get('finished'), time) - bisect_left(item.get('finished'), last_time) or 0
+
+            villager_delta = num_finished - num_destroyed
+            # seperate into unit, building, age, animal, upgrade, 
+            filtered = [e for e in events if e["time"] <= time and e["time"] > last_time and  e["event"] == 'FINISH']
+                
+            finished_buildings = [f for f in filtered if f["type"] == 'Building']
+            finished_units = [f for f in filtered if f["type"] == 'Unit']
+            finished_ages = [f for f in filtered if f["type"] == 'Age']
+            finished_animals = [f for f in filtered if f["type"] == 'Animal']
+            finished_upgrades = [f for f in filtered if f["type"] == 'Upgrade']
+            
+            bo = {
+                "finished_buildings": ";".join(f["entity"] for f in finished_buildings),
+                "finished_units": ";".join(f["entity"] for f in finished_units),
+                "finished_ages": ";".join(f["entity"] for f in finished_ages),
+                "finished_animals": ";".join(f["entity"] for f in finished_animals),
+                "finished_upgrades": ";".join(f["entity"] for f in finished_upgrades)
+            }
+
+            strat_label = calculate_strat_from_data(events, resource_snapshot) if strat_label == '' else strat_label
+
+            data_row.append(
+                meta_data | 
+                resource_data |  
+                {'villager_delta': villager_delta, 'time': time, 'phase': _phase_from_time(time)} |
+                bo |
+                {'strat': strat_label}
+            )  
+
+            last_time = time
+
+        evs.extend(data_row)   
+    return evs
+
+
+def collect_data_from_json(files):
+    all_events = []
+    if isinstance(files, str):
+        files = [files]
+    for fp in files:
+        for path in sorted(glob.glob(fp)):
+            print(f"[INFO] Extracting events from {path}")
+            if path.endswith('.jsonl'):
+                with open(path, 'r', encoding='utf-8') as fh:
+                    for lineno, line in enumerate(fh, 1):
+                        line = line.strip()
+                        if not line:
+                            continue
+                        try:
+                            obj = json.loads(line)
+                        except json.JSONDecodeError:
+                            print(f"[WARN] {path}:{lineno} JSON decode failed; skipping")
+                            continue
+                        
+                        all_events.extend(extract_events_from_obj(obj))
+    return all_events
+
+def split_events_array_by_player(all_events):
+    from collections import defaultdict
+    groups = defaultdict(list)
+    for e in all_events:
+        key = (e.get('game_id'), e.get('profile_id'))
+        groups[key].append(e)
+
+    return groups
+
+def prepare_transformer_csv(files, out_csv: str) -> None:
+    """Extract events from given file(s) and write a CSV suitable for transformer training.
+
+    Output columns: game_id, profile_id, event, entity, time, delta_time (s), delta_time_scaled (log1p), phase, player_civ, player_result, player_won, enemy_civ
+    """
+    all_events = collect_data_from_json(files)
+    groups = split_events_array_by_player(all_events)
+
+    with open(out_csv, 'w', newline='', encoding='utf-8') as out:
+        writer = csv.DictWriter(out, fieldnames=['game_id', 'profile_id', 'player_civ', 'enemy_civ', 'map', 'player_result', 'player_won', 'wood', 'food', 'gold', 'stone', 'wood_per_min', 'food_per_min', 'gold_per_min', 'stone_per_min',  'military', 'economy', 'technology', 'society', 'oliveoil', 'oliveoil_per_min','villager_delta', 'time', 'phase',  'finished_buildings', 'finished_units','finished_ages', 'finished_animals', 'finished_upgrades', 'strat']   )
+        writer.writeheader()
+        for ev in all_events:
+            writer.writerow(ev)
+
+    print(f"[INFO] Events CSV written to {out_csv}")
+
+def main():
+    p = argparse.ArgumentParser(description="Compute per-civilization winrates from collected .jsonl game records.")
+    p.add_argument("paths", nargs="*", help="Path(s) or glob(s) to .jsonl files. If omitted, all *.jsonl in CWD are used.")
+    p.add_argument("--winrate-heatmap", dest="winrate_heatmap", default="h2h_heatmap.png",
+                   help="Write winrate heatmap PNG (default: h2h_heatmap.png). Use empty string to skip.")
+    p.add_argument("--games-heatmap", dest="games_heatmap", default="h2h_games_heatmap.png",
+                   help="Write games-count heatmap PNG (default: h2h_games_heatmap.png). Use empty string to skip.")
+    p.add_argument("--min-games", dest="min_games", type=int, default=10,
+                   help="Minimum games threshold to highlight cells in games heatmap (default: 10).")
+    p.add_argument("--export-events", dest="export_events", default="transformer_input_test_v2.csv",
+                   help="Write transformer-ready events CSV to given path (e.g. events.csv). If empty, no events file is written.")
+    args = p.parse_args()
+
+    files = []
+    if args.paths:
+        for pat in args.paths:
+            files.extend(sorted(glob.glob(pat)))
+    else:
+        files = sorted(glob.glob("*.jsonl"))
+
+    if not files:
+        print("No .jsonl files found (pass one or more paths/globs).")
+        sys.exit(1)
+
+    # If requested, export events CSV (does not require computing civ stats)
+    if args.export_events:
+        prepare_transformer_csv(files, args.export_events)
+
+
+if __name__ == "__main__":
+    main()
