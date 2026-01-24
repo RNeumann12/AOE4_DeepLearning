@@ -44,6 +44,41 @@ def _clean_entity_from_icon(icon: str) -> str:
     name = name.replace('_', ' ').strip()
     return name.title()
 
+def get_age_up_times(actions: dict) -> Dict[str, int]:
+    """Return a dict with age up times in seconds based on player's actions."""
+    age_up_times = {}
+    feudal_age = actions.get('feudal_age', [])
+    castle_age = actions.get('castle_age', [])
+    imperial_age = actions.get('imperial_age', [])
+
+    if feudal_age:
+        age_up_times['FEUDAL'] = feudal_age[0]
+    if castle_age:
+        age_up_times['CASTLE'] = castle_age[0]
+    if imperial_age:
+        age_up_times['IMPERIAL'] = imperial_age[0]
+
+    return age_up_times
+
+def get_age_from_data(ages_hash, t: int) -> str:
+    """Return age label for a timestamp (seconds) based on player's actions."""
+
+    if not ages_hash:
+        return "DARK"
+
+    feudal_age = ages_hash.get('FEUDAL', float('inf'))
+    castle_age = ages_hash.get('CASTLE', float('inf'))
+    imperial_age = ages_hash.get('IMPERIAL', float('inf'))
+
+    if t < feudal_age:
+        return "DARK"
+    elif t < castle_age:
+        return "FEUDAL"
+    elif t < imperial_age:
+        return "CASTLE"
+    else:
+        return "IMPERIAL"
+
 def _game_duration_seconds(obj: dict) -> int | None:
     """Return game duration in seconds if available, otherwise None.
 
@@ -111,35 +146,66 @@ def extract_players_from_obj(obj: dict):
                 players.append(p)
     return players
 
-def calculate_strat_from_data(build_events: list, resource_data: Dict) -> str:
+def calculate_strat_from_data(build_events: list, resource_data: Dict, age_up_times) -> str:
     """
     Determines the strategy label based on a player's early game stats.
     Returns one of: turtle, eco, fast_castle, early_aggression, late_aggression
+
+    build_events: list of build event dicts with 'time' and 'entity'
+    resource_data: dict of resource snapshots keyed by time (seconds)
+    age_up_times: dict of age up times keyed by age name
     """
+    dark_resources = {k: v for k, v in resource_data.items() if k <= age_up_times.get('FEUDAL', float('inf'))}
+    feudal_resources = {k: v for k, v in resource_data.items() if k > age_up_times.get('FEUDAL', float('inf')) and k <= age_up_times.get('CASTLE', float('inf'))}
+    castle_resources = {k: v for k, v in resource_data.items() if k > age_up_times.get('CASTLE', float('inf')) and k <= age_up_times.get('IMPERIAL', float('inf'))}
+ 
+    dark_res = {
+        "wood": 0,
+        "food": 0,
+        "gold": 0,
+        "stone": 0
+    }
+    dark_res['wood'] = sum(entry["wood_per_min"] for entry in dark_resources.values()) / len(dark_resources) if dark_resources else 0
+    dark_res['food'] = sum(entry["food_per_min"] for entry in dark_resources.values()) / len(dark_resources) if dark_resources else 0
+    dark_res['gold'] = sum(entry["gold_per_min"] for entry in dark_resources.values()) / len(dark_resources) if dark_resources else 0
+    dark_res['stone'] = sum(entry["stone_per_min"] for entry in dark_resources.values())  / len(dark_resources) if dark_resources else 0
 
-    # Early game: first 180 seconds
-    early_resources =  {k: v for k, v in resource_data.items() if k <= 180}
-    late_resources =  {k: v for k, v in resource_data.items() if k > 180 and k <= 600}
-    
-    # Sum resources collected in early game
-    early_wood_mean = sum(entry["wood_per_min"] for entry in early_resources.values()) / len(early_resources)
-    early_food_mean = sum(entry["food_per_min"] for entry in early_resources.values()) / len(early_resources)
-    early_gold_mean = sum(entry["gold_per_min"] for entry in early_resources.values()) / len(early_resources)
-    early_stone_mean = sum(entry["stone_per_min"] for entry in early_resources.values())  / len(early_resources) 
+    feudal_res = {
+        "wood": 0,
+        "food": 0,
+        "gold": 0,
+        "stone": 0
+    }
+    feudal_res['wood'] = sum(entry["wood_per_min"] for entry in feudal_resources.values()) / len(feudal_resources) if feudal_resources else 0 
+    feudal_res['food'] = sum(entry["food_per_min"] for entry in feudal_resources.values()) / len(feudal_resources) if feudal_resources else 0
+    feudal_res['gold'] = sum(entry["gold_per_min"] for entry in feudal_resources.values()) / len(feudal_resources) if feudal_resources else 0
+    feudal_res['stone'] = sum(entry["stone_per_min"] for entry in feudal_resources.values())  / len(feudal_resources) if feudal_resources else 0
 
-    total_res_mean = early_wood_mean + early_food_mean + early_gold_mean + early_stone_mean
-    
-    count_early = len(early_resources) or 1
-    count_late = len(late_resources) or 1
+    castle_res = {
+        "wood": 0,
+        "food": 0,
+        "gold": 0,
+        "stone": 0
+    }
+    castle_res['wood'] = sum(entry["wood_per_min"] for entry in castle_resources.values()) / len(castle_resources) if castle_resources else 0
+    castle_res['food'] = sum(entry["food_per_min"] for entry in castle_resources.values()) / len(castle_resources) if castle_resources else 0
+    castle_res['gold'] = sum(entry["gold_per_min"] for entry in castle_resources.values()) / len(castle_resources) if castle_resources else 0
+    castle_res['stone'] = sum(entry["stone_per_min"] for entry in castle_resources.values())  / len(castle_resources) if castle_resources else 0
 
     # Sum military produced in early game
-    early_military = sum(entry["military"] for entry in early_resources.values()) / count_early
-    late_military = sum(entry["military"] for entry in late_resources.values()) / count_late
+    dark_military = sum(entry["military"] for entry in dark_resources.values()) / len(dark_resources) if dark_resources else 0
+    feudal_military = sum(entry["military"] for entry in feudal_resources.values()) / len(feudal_resources) if feudal_resources else 0
+    castle_military = sum(entry["military"] for entry in castle_resources.values()) / len(castle_resources) if castle_resources else 0
 
-    early_eco = sum(entry["economy"] for entry in early_resources.values()) / count_early
-    late_eco = sum(entry["economy"] for entry in late_resources.values()) / count_late
+    dark_eco = sum(entry["economy"] for entry in dark_resources.values()) / len(dark_resources) if dark_resources else 0
+    feudal_eco = sum(entry["economy"] for entry in feudal_resources.values()) / len(feudal_resources) if feudal_resources else 0
+    castle_eco = sum(entry["economy"] for entry in castle_resources.values()) / len(castle_resources) if castle_resources else 0
 
-    villager_count = 0
+    villager_count = {
+        "dark": 0,
+        "feudal": 0,
+        "castle": 0
+    }
     for item in build_events:
         icon = item.get('icon') or ''
         entity = _clean_entity_from_icon(icon)
@@ -147,21 +213,30 @@ def calculate_strat_from_data(build_events: list, resource_data: Dict) -> str:
         if entity != 'Villager':
             continue
 
-        villager_count = sum(x for x in item.get('finished') if x <= 180)
+        villager_count['dark'] += sum(x for x in item.get('finished') if x <= age_up_times.get('FEUDAL', float('inf')))
+        villager_count['feudal'] += sum(x for x in item.get('finished') if x <= age_up_times.get('CASTLE', float('inf')))
+        villager_count['castle'] += sum(x for x in item.get('finished') if x <= age_up_times.get('IMPERIAL', float('inf')))
 
-    # Heuristics for strategies
-    if early_military <= 5 and total_res_mean >= 300:
-        return "eco"  # focus on economy, low military
-    elif early_military <= 2 and villager_count >= 30:
-        return "fast_castle"  # builds fast economy to reach Castle Age
-    elif early_military >= 20 and early_military > early_eco * 0.4:
-        return "early_aggression"
-    elif  early_military <= 10 and late_military >= 30 and late_military > late_eco * 0.3:
-        return "late_aggression"
-    elif early_stone_mean >= 50 and early_military <= 3:
-        return "turtle"  # heavy defensive building
+    
+    # if dark_military > 5 --> early_aggression
+    # elif feudal_military > 10 --> late_aggression
+    # elif ageup_times['CASTLE'] < 600 and castle_res['food'] > 200 and villager_count['castle'] > 30 --> fast_castle
+    # elif dark_res['food'] > 150 and dark_res['wood'] > 150 and villager_count['dark'] > 20 --> eco
+    # else turtle   
+
+    strat_label = ''
+    if age_up_times.get('CASTLE', float('inf')) < 600 and castle_res['food'] > 200 and villager_count['castle'] > 30:
+        strat_label = 'fast_castle'
+    elif dark_res['food'] > 150 and dark_res['wood'] > 150 and villager_count['dark'] > 20:
+        strat_label = 'eco'
+    elif dark_military > 5:
+        strat_label = 'early_aggression'
+    elif feudal_military > 10: 
+        strat_label = 'late_aggression'
     else:
-        return "unknown"  # default fallback
+        strat_label = 'turtle'  
+    return strat_label
+
 
 
 def extract_events_from_obj(obj: dict):
@@ -260,9 +335,7 @@ def extract_events_from_obj(obj: dict):
 
         if resource_snapshot is None or not resource_snapshot:
             print("[WARN] no resource found")
-            return []
-        
-        
+            return []       
         
         build_order = player.get('build_order') or player.get('buildOrder') or []
         if not isinstance(build_order, list):
@@ -288,8 +361,13 @@ def extract_events_from_obj(obj: dict):
 
         last_time = 0
         data_row = []
-        strat_label = ''
+        
+        age_up_times = get_age_up_times(player.get('actions') or {})
+        strat_label = calculate_strat_from_data(events, resource_snapshot, age_up_times)
+
         for time, snap_shot in resource_snapshot.items(): 
+            age = get_age_from_data(age_up_times, time)
+
             resource_data = snap_shot.copy()
             meta_data = {
                 'game_id': game_id,
@@ -332,12 +410,10 @@ def extract_events_from_obj(obj: dict):
                 "finished_upgrades": ";".join(f["entity"] for f in finished_upgrades)
             }
 
-            strat_label = calculate_strat_from_data(events, resource_snapshot) if strat_label == '' else strat_label
-
             data_row.append(
                 meta_data | 
                 resource_data |  
-                {'villager_delta': villager_delta, 'time': time, 'phase': _phase_from_time(time)} |
+                {'villager_delta': villager_delta, 'time': time, 'phase': _phase_from_time(time), 'age': age} |
                 bo |
                 {'strat': strat_label}
             )  
@@ -388,7 +464,7 @@ def prepare_transformer_csv(files, out_csv: str) -> None:
     groups = split_events_array_by_player(all_events)
 
     with open(out_csv, 'w', newline='', encoding='utf-8') as out:
-        writer = csv.DictWriter(out, fieldnames=['game_id', 'profile_id', 'player_civ', 'enemy_civ', 'map', 'player_result', 'player_won', 'wood', 'food', 'gold', 'stone', 'wood_per_min', 'food_per_min', 'gold_per_min', 'stone_per_min',  'military', 'economy', 'technology', 'society', 'oliveoil', 'oliveoil_per_min','villager_delta', 'time', 'phase',  'finished_buildings', 'finished_units','finished_ages', 'finished_animals', 'finished_upgrades', 'strat']   )
+        writer = csv.DictWriter(out, fieldnames=['game_id', 'profile_id', 'player_civ', 'enemy_civ', 'map', 'player_result', 'player_won', 'wood', 'food', 'gold', 'stone', 'wood_per_min', 'food_per_min', 'gold_per_min', 'stone_per_min',  'military', 'economy', 'technology', 'society', 'oliveoil', 'oliveoil_per_min','villager_delta', 'time', 'phase', 'age', 'finished_buildings', 'finished_units','finished_ages', 'finished_animals', 'finished_upgrades', 'strat']   )
         writer.writeheader()
         for ev in all_events:
             writer.writerow(ev)
