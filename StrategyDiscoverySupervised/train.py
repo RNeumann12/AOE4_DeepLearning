@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from dataset import GameSequenceDataset
+from dataset2 import GameSequenceDataset2
 from model import StrategyGRU
 from tqdm import tqdm
 import wandb
@@ -10,11 +10,44 @@ from sklearn.metrics import confusion_matrix, classification_report, precision_r
 import matplotlib.pyplot as plt
 import seaborn as sns
 
+
+class LabelSmoothingLoss(nn.Module):
+    """Cross-entropy with label smoothing for better regularization and class balance"""
+    def __init__(self, num_classes, smoothing=0.1, weight=None):
+        super().__init__()
+        self.num_classes = num_classes
+        self.smoothing = smoothing
+        self.weight = weight
+        self.confidence = 1.0 - smoothing
+    
+    def forward(self, inputs, targets):
+        """
+        Args:
+            inputs: [batch_size, num_classes] logits
+            targets: [batch_size] class indices
+        """
+        log_probs = nn.functional.log_softmax(inputs, dim=-1)
+        
+        # Create smoothed target distribution
+        with torch.no_grad():
+            true_dist = torch.zeros_like(log_probs)
+            true_dist.fill_(self.smoothing / (self.num_classes - 1))
+            true_dist.scatter_(1, targets.unsqueeze(1), self.confidence)
+        
+        # KL divergence loss
+        loss = -torch.sum(true_dist * log_probs, dim=-1)
+        
+        # Apply class weights if provided
+        if self.weight is not None:
+            loss = loss * self.weight[targets]
+        
+        return loss.mean()
+
 CSV_PATH = 'transformer_input_test_v2.csv'
 SEQ_LEN = 50
 BATCH_SIZE = 128
-NUM_EPOCHS = 15
-LEARNING_RATE = 1e-4
+NUM_EPOCHS = 50
+LEARNING_RATE = 6e-4
 HIDDEN_SIZE = 128
 
 def train_epoch(model, dataloader, criterion, optimizer, device):
@@ -27,20 +60,20 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
     all_confidences = []
 
     pbar = tqdm(dataloader, desc="Epoch {epoch}Training", leave=False)
-    for numeric_seq, event_seq, mask, targets in pbar:
+    for numeric_seq, event_seq, time_seq, mask, player_civ, enemy_civ, map_id, age, targets in pbar:
         numeric_seq = numeric_seq.to(device)
         event_seq = event_seq.to(device)
+        time_seq = time_seq.to(device)
         mask = mask.to(device)
+        player_civ = player_civ.to(device)
+        enemy_civ = enemy_civ.to(device)
+        map_id = map_id.to(device)
+        age = age.to(device)
         targets = targets.to(device).long()
-
-        # print(numeric_seq.shape)
-        # print(event_seq.shape)
-        # print(mask.shape)
-        # print(targets.shape, targets.dtype)
 
         optimizer.zero_grad()
         
-        logits, _ = model(numeric_seq, event_seq, mask)
+        logits, _ = model(numeric_seq, event_seq, mask, time_seq, player_civ, enemy_civ, map_id, age)
         loss = criterion(logits, targets)
 
         loss.backward()
@@ -73,13 +106,18 @@ def evaluate(model, dataloader, criterion, device):
     all_targets = []
     all_confidences = []
 
-    for numeric_seq, event_seq, mask, targets in tqdm(dataloader, desc="Evaluating", leave=False):
+    for numeric_seq, event_seq, time_seq, mask, player_civ, enemy_civ, map_id, age, targets in tqdm(dataloader, desc="Evaluating", leave=False):
         numeric_seq = numeric_seq.to(device)
         event_seq = event_seq.to(device)
+        time_seq = time_seq.to(device)
         mask = mask.to(device)
+        player_civ = player_civ.to(device)
+        enemy_civ = enemy_civ.to(device)
+        map_id = map_id.to(device)
+        age = age.to(device)
         targets = targets.to(device).long()
 
-        logits, _ = model(numeric_seq, event_seq, mask)
+        logits, _ = model(numeric_seq, event_seq, mask, time_seq, player_civ, enemy_civ, map_id, age)
 
         loss = criterion(logits, targets)
         total_loss += loss.item()
@@ -292,7 +330,40 @@ def main():
         }
     )
 
-    dataset = GameSequenceDataset(csv_path, seq_len=seq_len)
+    dataset = GameSequenceDataset2(csv_path, seq_len=seq_len)
+    
+    # Extract targets from sequences for class distribution analysis
+    dataset_targets = [seq['target'] for seq in dataset.sequences]
+    
+    # Debug: Check class distribution
+    unique_classes, class_counts = np.unique(dataset_targets, return_counts=True)
+    print(f"\nClass distribution in dataset:")
+    print(f"{'Strategy Name':<30} {'Class ID':<12} {'Count':<12} {'Percentage':<12}")
+    print("=" * 66)
+    
+    # Create reverse mapping from index to strategy name
+    idx_to_strat = {v: k for k, v in dataset.strat_vocab.items()}
+    
+    for class_id, count in zip(unique_classes, class_counts):
+        class_name = idx_to_strat[class_id]
+        percentage = (count / len(dataset)) * 100
+        print(f"{class_name:<30} {class_id:<12} {count:<12} {percentage:>10.1f}%")
+    
+    # Calculate class weights (inverse frequency) to handle imbalance
+    class_weights = torch.zeros(len(dataset.strat_vocab))
+    for class_id, count in zip(unique_classes, class_counts):
+        # Weight inversely proportional to frequency
+        class_weights[class_id] = len(dataset) / (len(dataset.strat_vocab) * count)
+    
+    # Normalize weights
+    class_weights = class_weights / class_weights.sum() * len(dataset.strat_vocab)
+    print(f"\nClass weights for loss function:")
+    print(f"{'Strategy Name':<30} {'Weight':<15}")
+    print("=" * 45)
+    for class_id in range(len(dataset.strat_vocab)):
+        class_name = idx_to_strat[class_id]
+        print(f"{class_name:<30} {class_weights[class_id]:.4f}")
+    
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
@@ -306,10 +377,14 @@ def main():
         hidden_size=hidden_size,
         num_layers=2,
         num_classes=len(dataset.strat_vocab),
-        dropout=0.3
+        dropout=0.26,
+        num_civs=len(dataset.civ_vocab),
+        num_enemy_civs=len(dataset.enemy_civ_vocab),
+        num_maps=len(dataset.map_vocab),
+        num_ages=len(dataset.age_vocab) if dataset.age_vocab else 1
     ).to(device)
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = LabelSmoothingLoss(num_classes=len(dataset.strat_vocab), smoothing=0.09, weight=class_weights.to(device))
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
     
     # Track metrics for plotting
@@ -317,67 +392,125 @@ def main():
     val_losses = []
     train_accs = []
     val_accs = []
+    
+    # Early stopping
+    best_val_acc = 0.0
+    patience = 6
+    patience_counter = 0
+    best_model_state = None
 
     for epoch in range(1, num_epochs+1):
+        # Debug: Check model parameter changes
+        param_before = next(model.parameters()).clone().detach()
+        
         train_loss, train_acc, train_preds, train_targets, train_confidences = train_epoch(model, train_loader, criterion, optimizer, device)
+        
+        # Check if parameters changed
+        param_after = next(model.parameters()).detach()
+        param_changed = not torch.allclose(param_before, param_after)
+        
         val_loss, val_acc, val_preds, val_targets, val_confidences = evaluate(model, val_loader, criterion, device)
 
         train_losses.append(train_loss)
         val_losses.append(val_loss)
         train_accs.append(train_acc)
         val_accs.append(val_acc)
-
-        # Log basic metrics
+        
         wandb.log({
-            "Train Loss": train_loss,
+            "Train Loss (raw)": train_loss,
             "Train Accuracy": train_acc,
-            "Validation Loss": val_loss,
+            "Validation Loss (raw)": val_loss,
             "Validation Accuracy": val_acc,
             "Epoch": epoch
         })
 
         print(f"Epoch {epoch}/{num_epochs} - Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}, Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.4f}")
+        print(f"  Parameters updated: {param_changed}")
         
-        # Log confusion matrices every 5 epochs
-        if epoch % 5 == 0:
+        # Debug: Check prediction distribution
+        unique_preds, counts = np.unique(val_preds, return_counts=True)
+        pred_dist = {f"class_{uid}": cnt for uid, cnt in zip(unique_preds, counts)}
+        print(f"  Validation prediction distribution: {pred_dist}")
+        print(f"  Validation unique predictions: {len(unique_preds)} out of {len(dataset.strat_vocab)} classes")
+        
+        # Early stopping check
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            patience_counter = 0
+            best_model_state = model.state_dict().copy()
+            print(f"  ✓ Best validation accuracy: {best_val_acc:.4f}")
+        else:
+            patience_counter += 1
+            print(f"  ✗ No improvement. Patience: {patience_counter}/{patience}")
+            
+            if patience_counter >= patience:
+                print(f"\n🛑 Early stopping triggered at epoch {epoch}")
+                print(f"Best validation accuracy was: {best_val_acc:.4f}")
+                model.load_state_dict(best_model_state)
+                break
+        
+        # Log confusion matrices every epoch
+        if True:
             plot_confusion_matrix(train_preds, train_targets, dataset, "Train")
             plot_confusion_matrix(val_preds, val_targets, dataset, "Validation")
         
-        # Log classification metrics and confidence metrics every 5 epochs
-        if epoch % 5 == 0:
+        # Log classification metrics and confidence metrics every epoch
+        if True:
             log_classification_metrics(train_preds, train_targets, dataset, "Train")
             log_classification_metrics(val_preds, val_targets, dataset, "Validation")
             log_confidence_metrics(train_preds, train_targets, train_confidences, dataset, "Train")
             log_confidence_metrics(val_preds, val_targets, val_confidences, dataset, "Validation")
     
     # Log final training curves
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
     
-    # Loss curve
-    ax1.plot(train_losses, label='Train Loss', marker='o')
-    ax1.plot(val_losses, label='Validation Loss', marker='s')
-    ax1.set_xlabel('Epoch')
-    ax1.set_ylabel('Loss')
-    ax1.set_title('Training and Validation Loss')
-    ax1.legend()
-    ax1.grid(True, alpha=0.3)
+    # Train/Val Loss curve
+    axes[0, 0].plot(train_losses, label='Train Loss', marker='o')
+    axes[0, 0].plot(val_losses, label='Validation Loss', marker='s')
+    axes[0, 0].set_xlabel('Epoch')
+    axes[0, 0].set_ylabel('Loss')
+    axes[0, 0].set_title('Training and Validation Loss')
+    axes[0, 0].legend()
+    axes[0, 0].grid(True, alpha=0.3)
+    
+    # Loss difference (to show overfitting)
+    train_losses_array = np.array(train_losses)
+    val_losses_array = np.array(val_losses)
+    loss_diff = val_losses_array - train_losses_array
+    axes[0, 1].plot(loss_diff, label='Val Loss - Train Loss', marker='o', color='red')
+    axes[0, 1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    axes[0, 1].set_xlabel('Epoch')
+    axes[0, 1].set_ylabel('Loss Difference')
+    axes[0, 1].set_title('Overfitting Indicator (positive = overfitting)')
+    axes[0, 1].legend()
+    axes[0, 1].grid(True, alpha=0.3)
     
     # Accuracy curve
-    ax2.plot(train_accs, label='Train Accuracy', marker='o')
-    ax2.plot(val_accs, label='Validation Accuracy', marker='s')
-    ax2.set_xlabel('Epoch')
-    ax2.set_ylabel('Accuracy')
-    ax2.set_title('Training and Validation Accuracy')
-    ax2.legend()
-    ax2.grid(True, alpha=0.3)
+    axes[1, 0].plot(train_accs, label='Train Accuracy', marker='o')
+    axes[1, 0].plot(val_accs, label='Validation Accuracy', marker='s')
+    axes[1, 0].set_xlabel('Epoch')
+    axes[1, 0].set_ylabel('Accuracy')
+    axes[1, 0].set_title('Training and Validation Accuracy')
+    axes[1, 0].legend()
+    axes[1, 0].grid(True, alpha=0.3)
+    
+    # Loss difference (to show overfitting)
+    loss_diff = val_losses_array - train_losses_array
+    axes[1, 1].plot(loss_diff, label='Val Loss - Train Loss', marker='o', color='red')
+    axes[1, 1].axhline(y=0, color='k', linestyle='--', alpha=0.3)
+    axes[1, 1].set_xlabel('Epoch')
+    axes[1, 1].set_ylabel('Loss Difference')
+    axes[1, 1].set_title('Overfitting Indicator (positive = overfitting)')
+    axes[1, 1].legend()
+    axes[1, 1].grid(True, alpha=0.3)
     
     plt.tight_layout()
     wandb.log({"Training Curves": wandb.Image(fig)})
     plt.close()
     
     # Save model checkpoint
-    torch.save(model.state_dict(), 'best_strategy_model.pth')
-    wandb.save('best_strategy_model.pth')
+    torch.save(model.state_dict(), 'best_strategy_model.pt')
+    wandb.save('best_strategy_model.pt')
 
 
 if __name__ == "__main__":

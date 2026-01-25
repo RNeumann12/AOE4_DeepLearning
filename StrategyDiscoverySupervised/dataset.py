@@ -94,9 +94,19 @@ class GameSequenceDataset(Dataset):
                 
                 # Event features (multi-hot)
                 event_vec = torch.zeros(len(self.event_vocab))
+                events_found = False
                 for col in self.event_cols:
-                    for idx in self.encode_events(row[col]):
+                    encoded = self.encode_events(row[col])
+                    if encoded:
+                        events_found = True
+                    for idx in encoded:
                         event_vec[idx] = 1.0
+                
+                # Debug: print first few samples
+                if i < 3 and not events_found:
+                    print(f"Warning: No events found for game {game_id}, player {profile_id}, row {i}")
+                    print(f"  Event columns: {[row[col] for col in self.event_cols]}")
+                
                 seq_events[i] = event_vec
 
                 mask[i] = 1
