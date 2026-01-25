@@ -1,0 +1,25 @@
+1      Villager                                
+2      House                                   
+3      Villager                                
+4      Gold Mining Camp                        
+5      Villager                                
+6      Villager                                
+7      Villager                                
+8      Villager                                
+9      Gold Mining Camp                        
+10     Villager                                
+11     Villager                                
+12     Lumber Camp                             
+13     Villager                                
+14     Villager                                
+15     Villager                                
+16     House                                   
+17     Villager                                
+18     Villager                                
+19     Age2 Westminster Abbey Eng       
+20     Age Display Persistent 2                
+21     Villager                                
+22     Villager                                
+23     Crown King                              
+24     Town Center                             
+25     Villager  
