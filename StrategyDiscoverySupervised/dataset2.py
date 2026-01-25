@@ -23,14 +23,16 @@ class GameSequenceDataset2(Dataset):
         'finished_buildings',
         'finished_units',
         'finished_upgrades',
-        'finished_animals'
+#        'finished_animals'
     ]
     
     # Numerical/resource columns
     NUMERICAL_COLS = [
-        'food', 'wood', 'gold', 'stone', 'military', 'economy', 'technology', 'society',
-        'food_per_min', 'wood_per_min', 'gold_per_min', 'stone_per_min',
-        'villager_delta', 'oliveoil', 'oliveoil_per_min'
+        #'food', 'wood', 'gold', 'stone', 
+        'military', 'economy', 'technology', 'society',
+        # 'food_per_min', 'wood_per_min', 'gold_per_min', 'stone_per_min',
+        'villager_delta', 
+        #'oliveoil', 'oliveoil_per_min'
     ]
     
     def __init__(self, csv_path, seq_len=50, target_col='strat'):
