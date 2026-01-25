@@ -13,7 +13,6 @@ NUM_EPOCHS = 15
 LEARNING_RATE = 1e-4
 HIDDEN_SIZE = 128
 
-
 def train_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
     total_loss = 0.0
@@ -88,6 +87,11 @@ def main():
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # device = torch.device('cpu')
+
+    # Clear any cached memory before starting
+    torch.cuda.empty_cache()
+    if hasattr(torch.cuda, 'reset_peak_memory_stats'):
+        torch.cuda.reset_peak_memory_stats()
 
     wandb.init(
         project="DeepLearning-StrategieDiscoverySupervised",
