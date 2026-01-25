@@ -6,11 +6,13 @@ This version uses the encoder-decoder architecture where:
 - Decoder: Uses cross-attention to encoder memory for generation
 
 Example:
-  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint best_model.pth --top_probs 5 --player_civ English --enemy_civ French --map "Altai" --build_steps 30 --temperature 0.3 --top_p 0.9 --seed 42
-  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint best_model.pth --player_civ sengoku_daimyo --enemy_civ French --map "Altai" --build_steps 30 --temperature 0.3 --top_p 0.9 --seed 42
-  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint best_model.pth --player_civ French --enemy_civ French --map "Dry Arabia" --build_steps 30 --temperature 0.3 --top_p 0.9 --seed 42
-  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint best_model.pth --player_civ French --enemy_civ French --map "Four Lakes" --build_steps 30 --temperature 0.3 --top_p 0.9 --seed 42
-  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint best_model.pth --player_civ English --enemy_civ French --map "Four Lakes" --build_steps 30 --temperature 0.3 --seed 42 --greedy
+  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --top_probs 5 --player_civ English --enemy_civ French --map "Dry Arabia" --build_steps 30 --temperature 0.3 --top_p 0.9 --seed 42
+  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ sengoku_daimyo --enemy_civ French --map "Altai" --build_steps 30 --greedy
+  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ English --enemy_civ French --map "Four Lakes" --build_steps 30 --greedy
+  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ French --enemy_civ French --map "Four Lakes" --build_steps 30 --greedy
+  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ abbasid_dynasty --enemy_civ English --map "Dry Arabia" --build_steps 30 --greedy
+  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ English --enemy_civ French --map "Dry Arabia" --build_steps 30 --greedy
+
     """
 import os
 import sys
@@ -306,8 +308,55 @@ def generate_build_order(
                 torch.tensor([[next_entity]], device=device)
             ], dim=1)
     
+    # Compute plausibility score by re-evaluating the full sequence
+    step_probs = []
+    with torch.no_grad():
+        for i in range(1, len(generated_entities)):
+            # Get prefix up to step i
+            prefix_seq = torch.tensor([generated_entities[:i]], dtype=torch.long, device=device)
+            
+            # Truncate if needed
+            if prefix_seq.size(1) > max_entity_seq_len:
+                prefix_seq = prefix_seq[:, -max_entity_seq_len:]
+            
+            # Get logits for next token prediction
+            logits = model(
+                prefix_seq,
+                player_civ, enemy_civ, map_tensor,
+                encoder_memory=encoder_memory,
+                predict_next=True
+            )
+            
+            probs = torch.softmax(logits[0], dim=-1)
+            actual_next = generated_entities[i]
+            step_prob = probs[actual_next].item()
+            step_probs.append(step_prob)
+    
+    # Calculate plausibility metrics
+    import math
+    if step_probs:
+        log_probs = [math.log(p + 1e-10) for p in step_probs]
+        mean_log_prob = sum(log_probs) / len(log_probs)
+        perplexity = math.exp(-mean_log_prob)
+        geometric_mean = math.exp(mean_log_prob)
+        min_prob = min(step_probs)
+        max_prob = max(step_probs)
+        median_prob = sorted(step_probs)[len(step_probs) // 2]
+        
+        plausibility_info = {
+            'step_probs': step_probs,
+            'geometric_mean': geometric_mean,
+            'perplexity': perplexity,
+            'mean_log_prob': mean_log_prob,
+            'min_prob': min_prob,
+            'max_prob': max_prob,
+            'median_prob': median_prob
+        }
+    else:
+        plausibility_info = None
+    
     # Skip the seed token in output
-    return generated_entities[1:]
+    return generated_entities[1:], plausibility_info
 
 
 def pretty_print_build_order(
@@ -379,6 +428,58 @@ def analyze_build_order(entities: list, inv_entity: Dict[int, str]):
     age_markers = [e for e in entity_counts.keys() if 'Age Display' in e or 'age' in e.lower()]
     if age_markers:
         print(f"\nAge transitions detected: {', '.join(age_markers)}")
+    
+    print("=" * 60)
+
+
+def print_plausibility_score(plausibility_info: dict, inv_entity: Dict[int, str] = None, entities: list = None):
+    """Print the overall plausibility score for the generated build order."""
+    if plausibility_info is None:
+        print("\n(No plausibility data available)")
+        return
+    
+    print("\n" + "=" * 60)
+    print("PLAUSIBILITY SCORE")
+    print("=" * 60)
+    
+    gm = plausibility_info['geometric_mean']
+    perp = plausibility_info['perplexity']
+    
+    # Convert geometric mean to a 0-100 confidence score
+    # Higher geometric mean = higher confidence
+    confidence_pct = gm * 100
+    
+    print(f"\n  Overall Confidence:    {confidence_pct:.2f}%")
+    print(f"  Geometric Mean Prob:   {gm:.4f}")
+    print(f"  Perplexity:            {perp:.2f} (lower = more confident)")
+    print(f"  Mean Log Probability:  {plausibility_info['mean_log_prob']:.4f}")
+    print(f"\n  Per-step statistics:")
+    print(f"    Min probability:     {plausibility_info['min_prob']:.4f} ({plausibility_info['min_prob']*100:.2f}%)")
+    print(f"    Max probability:     {plausibility_info['max_prob']:.4f} ({plausibility_info['max_prob']*100:.2f}%)")
+    print(f"    Median probability:  {plausibility_info['median_prob']:.4f} ({plausibility_info['median_prob']*100:.2f}%)")
+    
+    # Provide interpretation
+    print(f"\n  Interpretation:")
+    if confidence_pct >= 50:
+        print(f"    ✓ High confidence - Model is very sure about this build order")
+    elif confidence_pct >= 25:
+        print(f"    ~ Moderate confidence - Build order follows common patterns")
+    elif confidence_pct >= 10:
+        print(f"    ! Low confidence - Some unconventional choices")
+    else:
+        print(f"    ✗ Very low confidence - Build order may be unusual or model is uncertain")
+    
+    # Flag any very low probability steps
+    low_prob_steps = [(i, p) for i, p in enumerate(plausibility_info['step_probs']) if p < 0.05]
+    if low_prob_steps and len(low_prob_steps) <= 5:
+        print(f"\n  Low-confidence steps (prob < 5%):")
+        for step_idx, prob in low_prob_steps:
+            entity_name = ""
+            if inv_entity is not None and entities is not None and step_idx < len(entities):
+                entity_name = f" - {inv_entity.get(entities[step_idx], '?')}"
+            print(f"    Step {step_idx + 1}: {prob*100:.2f}%{entity_name}")
+    elif low_prob_steps:
+        print(f"\n  {len(low_prob_steps)} steps have probability < 5%")
     
     print("=" * 60)
 
@@ -484,7 +585,7 @@ def main():
         print(f"  Seed:       {args.seed}")
     
     # Generate build order
-    entities = generate_build_order(
+    entities, plausibility_info = generate_build_order(
         model=model,
         player_civ_id=player_civ_id,
         enemy_civ_id=enemy_civ_id,
@@ -505,6 +606,9 @@ def main():
     # Print results
     inv_entity = invert_vocab(entity_vocab)
     pretty_print_build_order(entities, inv_entity)
+    
+    # Print plausibility score
+    print_plausibility_score(plausibility_info, inv_entity, entities)
     
     # Optional analysis
     if args.analyze:
