@@ -1,0 +1,145 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import re
+
+# 1. Prepare the data
+data_text = """Top 100 most common entities:
+ 1. Villager                      :  346968 (24.26%)
+ 2. Palisade Wall                 :   78013 (5.45%)
+ 3. Wheat Field                   :   66295 (4.63%)
+ 4. House                         :   45567 (3.19%)
+ 5. Spearman 2                    :   44653 (3.12%)
+ 6. Archer 2                      :   44009 (3.08%)
+ 7. Sheep                         :   33428 (2.34%)
+ 8. Spearman 3                    :   33237 (2.32%)
+ 9. Archer 3                      :   29288 (2.05%)
+10. Crossbowman 3                 :   26425 (1.85%)
+11. Gilded Villager               :   22040 (1.54%)
+12. Lumber Camp                   :   18749 (1.31%)
+13. Knight 3                      :   17805 (1.24%)
+14. Horseman 2                    :   15955 (1.12%)
+15. Gristmill                     :   15195 (1.06%)
+16. Mounted Samurai 3             :   14934 (1.04%)
+17. Horseman 3                    :   12952 (0.91%)
+18. Stable                        :   12565 (0.88%)
+19. Manatarms 3                   :   12076 (0.84%)
+20. Archery Range                 :   11696 (0.82%)
+21. Gold Mining Camp              :   11262 (0.79%)
+22. Yumi Ashigaru 2               :   10923 (0.76%)
+23. Yumi Ashigaru 3               :   10624 (0.74%)
+24. Scout                         :   10527 (0.74%)
+25. Outpost                       :   10408 (0.73%)
+26. Shinobi                       :   10023 (0.70%)
+27. Barracks                      :    9866 (0.69%)
+28. Monk                          :    9608 (0.67%)
+29. Farmhouse                     :    9097 (0.64%)
+30. Riddari Age3                  :    8112 (0.57%)
+31. Sofa 3                        :    7635 (0.53%)
+32. Spearman 1                    :    7555 (0.53%)
+33. Aquaeducts                    :    7114 (0.50%)
+34. Palisade Gate                 :    6996 (0.49%)
+35. Spearman 4                    :    6396 (0.45%)
+36. Town Centre Capitol           :    5629 (0.39%)
+37. Cattle                        :    5340 (0.37%)
+38. Age Display Persistent 2      :    5307 (0.37%)
+39. Yari Age2                     :    5258 (0.37%)
+40. Lancer 2                      :    5249 (0.37%)
+41. Horsearcher 3                 :    5157 (0.36%)
+42. Hobelar Age2                  :    5139 (0.36%)
+43. Ger                           :    5008 (0.35%)
+44. Varangian Age2                :    4849 (0.34%)
+45. Sipahi 2                      :    4761 (0.33%)
+46. Camel Lancer 3                :    4724 (0.33%)
+47. Yeoman Age2                   :    4691 (0.33%)
+48. Torguud                       :    4661 (0.33%)
+49. Bogmadr Age3                  :    4622 (0.32%)
+50. Blacksmith                    :    4154 (0.29%)
+51. Kipchak Age3                  :    4039 (0.28%)
+52. Age Display Persistent 3      :    3971 (0.28%)
+53. Wood Gather 1                 :    3881 (0.27%)
+54. Atgeir Age2                   :    3878 (0.27%)
+55. Horseman 4                    :    3817 (0.27%)
+56. Ranged Armor Technology 1     :    3795 (0.27%)
+57. Sipahi 3                      :    3652 (0.26%)
+58. Champion                      :    3586 (0.25%)
+59. Donso 3                       :    3444 (0.24%)
+60. Keshik 2                      :    3429 (0.24%)
+61. Wheelbarrow                   :    3425 (0.24%)
+62. Tanegashima Ashigaru Age3     :    3365 (0.24%)
+63. Donso 2                       :    3325 (0.23%)
+64. Manatarms 4                   :    3313 (0.23%)
+65. Ranged Damage Technology 1    :    3153 (0.22%)
+66. Lancer 3                      :    3134 (0.22%)
+67. Yatai                         :    3121 (0.22%)
+68. Archer 4                      :    3063 (0.21%)
+69. Palace Guard 3                :    2952 (0.21%)
+70. Desert Rider 3                :    2876 (0.20%)
+71. Gilded Spearman 3             :    2821 (0.20%)
+72. Fishing Boat                  :    2800 (0.20%)
+73. Trade Cart                    :    2771 (0.19%)
+74. Food Gather 1                 :    2769 (0.19%)
+75. Kharash                       :    2751 (0.19%)
+76. Repeater Crossbowman 2        :    2710 (0.19%)
+77. Hunting Villager              :    2697 (0.19%)
+78. Lord Lancaster                :    2646 (0.18%)
+79. Yeoman Age3                   :    2630 (0.18%)
+80. Bogmadr Age2                  :    2605 (0.18%)
+81. Gold Gather 1                 :    2584 (0.18%)
+82. Musofadi 3                    :    2574 (0.18%)
+83. Stone Wall                    :    2557 (0.18%)
+84. Jannisary 3                   :    2542 (0.18%)
+85. Knight 4                      :    2434 (0.17%)
+86. Repeater Crossbowman 3        :    2418 (0.17%)
+87. Springald                     :    2397 (0.17%)
+88. Ghazi Rider 2                 :    2314 (0.16%)
+89. Imperial Official             :    2284 (0.16%)
+90. Limitanei 2                   :    2183 (0.15%)
+91. Sofa 2                        :    2177 (0.15%)
+92. Monastery                     :    2130 (0.15%)
+93. Atgeir Age3                   :    2096 (0.15%)
+94. Keshik 3                      :    2069 (0.14%)
+95. Scorpion                      :    2025 (0.14%)
+96. Melee Armor Technology 1      :    2017 (0.14%)
+97. Miningcamp                    :    2001 (0.14%)
+98. Ranged Armor Technology 2     :    1999 (0.14%)
+99. Mangonel                      :    1994 (0.14%)
+100. Melee Damage Technology 1     :    1991 (0.14%)"""
+
+lines = data_text.strip().split('\n')
+names = []
+counts = []
+
+for line in lines:
+    parts = line.split(':')
+    # Clean name (remove "1. ")
+    name = re.sub(r'^\d+\.\s*', '', parts[0].strip())
+    # Clean count (remove percentage)
+    count_str = parts[1].strip().split('(')[0].strip() if len(parts) > 1 else ''
+    if count_str.isdigit():
+        count = int(count_str)
+        names.append(name)
+        counts.append(count)
+    else:
+        # Skip lines that do not match expected format
+        continue
+
+df = pd.DataFrame({'Entity': names, 'Count': counts})
+
+# 2. Categorize (Simple Keyword Logic)
+def categorize(name):
+    n = name.lower()
+    if any(x in n for x in ['villager', 'sheep', 'wheat', 'cattle', 'farm', 'lumber', 'mining']):
+        return 'Economy'
+    if any(x in n for x in ['wall', 'house', 'stable', 'barracks', 'outpost', 'camp']):
+        return 'Buildings'
+    return 'Military/Other'
+
+df['Category'] = df['Entity'].apply(categorize)
+
+# 3. Create Visualization (Example: Top 20)
+plt.figure(figsize=(12, 8))
+sns.barplot(x='Count', y='Entity', data=df.head(20), palette='viridis')
+plt.title('Top 20 Detected Entities')
+plt.tight_layout()
+plt.savefig('top_20_chart.png')

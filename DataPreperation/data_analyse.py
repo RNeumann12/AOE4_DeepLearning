@@ -7,7 +7,7 @@ entity_vocab = checkpoint['entity_vocab']
 inv_vocab = {v: k for k, v in entity_vocab.items()}
 
 # Load the training data and count entity frequencies
-df = pd.read_csv('input_with_map.csv')
+df = pd.read_csv('transformer_input_new.csv')
 df = df[df['event'] != 'DESTROY']  # Same filter as training
 
 # Count entity frequencies
