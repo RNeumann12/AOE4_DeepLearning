@@ -3,6 +3,11 @@ Training script for AoE4 transformer win prediction.
 
 Usage example:
     python -m WinRatePrediction.WinRate_train --csv transformer_input.csv --epochs 10 --batch_size 64 --device cuda
+    python -m WinRatePrediction.WinRate_train --csv transformer_input.csv --epochs 20 --batch_size 64 --device cuda --max_len 50 --output best_model_len_50.pt
+
+    python -m WinRatePrediction.WinRate_train --filter_destroy_events --csv transformer_input.csv --epochs 20 --batch_size 64 --device cuda --max_len 50 --output best_model_len_50_no_destroy.pt
+    python -m WinRatePrediction.WinRate_train --filter_destroy_events --csv transformer_input_new.csv --epochs 20 --batch_size 64 --device cuda --max_len 200 --output best_model_len_200_no_destroy.pt
+
 """
 import argparse
 import os
@@ -207,6 +212,22 @@ def main(args):
 
     print('Building vocabs...')
     df = pd.read_csv(args.csv)
+    
+    # Optionally filter out DESTROY events
+    temp_csv_path = None
+    if args.filter_destroy_events:
+        import tempfile
+        original_len = len(df)
+        df = df[df['event'] != 'DESTROY']
+        print(f"Filtered out DESTROY events: {original_len} -> {len(df)} rows ({original_len - len(df)} removed)")
+        # Save filtered data to temp file so dataset loads the filtered version
+        temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
+        df.to_csv(temp_csv.name, index=False)
+        temp_csv_path = temp_csv.name
+        csv_path = temp_csv_path
+    else:
+        csv_path = args.csv
+    
     vocabs = build_vocabs(df)
 
     # Determine longest sequence in dataset and decide a safe positional length / truncation
@@ -222,7 +243,7 @@ def main(args):
 
     print('Creating dataset...')
     # Pass truncation strategy so we keep head+tail (or other) rather than naively truncating only head
-    dataset = AoEEventDataset(args.csv, vocabs['entity_vocab'], vocabs['event_vocab'], vocabs['civ_vocab'], vocabs['map_vocab'],max_len=desired_max_len, truncation_strategy=args.truncation_strategy)
+    dataset = AoEEventDataset(csv_path, vocabs['entity_vocab'], vocabs['event_vocab'], vocabs['civ_vocab'], vocabs['map_vocab'],max_len=desired_max_len, truncation_strategy=args.truncation_strategy)
 
     # Use the same length for model positional embeddings
     model_max_len = desired_max_len if desired_max_len > 0 else 1
@@ -374,9 +395,13 @@ def main(args):
                 run.summary['best_val_auc'] = val_auc
 
     print('Training finished.')
+    
+    # Clean up temp file if created
+    if temp_csv_path is not None:
+        os.unlink(temp_csv_path)
+    
     if run is not None:
         run.finish()
-
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
@@ -404,5 +429,6 @@ if __name__ == '__main__':
     parser.add_argument('--wandb_project', type=str, default='DeepLearning-WinRate', help='W&B project')
     parser.add_argument('--wandb_epochs', type=int, default=None, help='Override epochs in W&B config')
     parser.add_argument('--wandb_learning_rate', type=float, default=None, help='Override learning rate in W&B config')
+    parser.add_argument('--filter_destroy_events', action='store_true', default=False, help='Filter out all DESTROY events from training data')
     args = parser.parse_args()
     main(args)
