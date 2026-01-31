@@ -213,9 +213,9 @@ def calculate_strat_from_data(build_events: list, resource_data: Dict, age_up_ti
     feudal_res['economy'] = sum(entry["economy"] for entry in feudal_resources.values()) / len(feudal_resources) if feudal_resources else 0
     castle_res['economy'] = sum(entry["economy"] for entry in castle_resources.values()) / len(castle_resources) if castle_resources else 0
 
-    tc_buildings = ['Town Centre Capitol', 'Town Centre']
+    tc_buildings = ['Town Center'] # Town Centre Capitol (Start TC)
     military_buildings = ['Barracks', 'Archery Range', 'Stable', 'Siege Workshop']
-    defensive_buildings = ['Outpost', 'Stone Outpost', 'Toll Outpost', 'Fortified Outpost', 'Tower', 'Palisade Gate', 'Palisade Wall']
+    defensive_buildings = ['Outpost', 'Stone Outpost', 'Toll Outpost', 'Fortified Outpost', 'Tower', 'Palisade Gate', 'Palisade Wall', 'Keep']
 
     for item in build_events:
         entity = item.get('entity')
@@ -243,16 +243,17 @@ def calculate_strat_from_data(build_events: list, resource_data: Dict, age_up_ti
             castle_res['towers'] += 1 if item.get('time') < age_up_times.get('IMPERIAL', float('inf')) else 0
 
     strat_label = ''
-    if 'towncenters' in dark_res and dark_res['towncenters'] > 1:
+    # Eventuell zustätzliche Idee: Eco Label -> wenn Trader gebaut werden in Feudal
+    if 'towncenters' in feudal_res and feudal_res['towncenters'] > 1:
         strat_label = 'eco'
     elif age_up_times.get('CASTLE', float('inf')) < 600:
         strat_label = 'fast_castle'
+    elif 'towers' in dark_res and dark_res['towers'] > 0 or 'towers' in dark_res and dark_res['towers'] > 3:
+        strat_label = 'turtle' 
     elif 'military_buildings' in dark_res and dark_res['military_buildings'] > 0:
         strat_label = 'early_aggression'
     elif 'military_buildings' in castle_res and castle_res['military_buildings'] > 0: 
         strat_label = 'late_aggression'
-    elif 'towers' in dark_res and dark_res['towers'] > 0:
-        strat_label = 'turtle' 
     else:
         strat_label = 'unknown'
     return strat_label
@@ -366,11 +367,7 @@ def extract_events_from_obj(obj: dict):
             icon = item.get('icon') or ''
             entity = _clean_entity_from_icon(icon)
 
-            # if entity == 'Villager':
-            #     continue
-
-            # types to map => event name
-            for key, name in (('constructed', 'BUILD'), ('finished', 'FINISH'), ('destroyed', 'DESTROY')):  
+            for key, name in (('constructed', 'BUILD'), ('finished', 'FINISH'), ('destroyed', 'DESTROY'), ('constructed', 'CONSTRUCT')):
                 for t in item.get(key) or []:
                     events.append({
                         'event': name,
@@ -390,6 +387,9 @@ def extract_events_from_obj(obj: dict):
 
         for time, snap_shot in resource_snapshot.items(): 
             age = get_age_from_data(age_up_times, time)
+
+            if time > 900 or age == 'IMPERIAL':
+                break
 
             resource_data = snap_shot.copy()
             meta_data = {
@@ -417,20 +417,22 @@ def extract_events_from_obj(obj: dict):
 
             villager_delta = num_finished - num_destroyed
             # seperate into unit, building, age, animal, upgrade, 
-            filtered = [e for e in events if e["time"] <= time and e["time"] > last_time and  e["event"] == 'BUILD' and e["entity"] != 'Villager']
-                
-            finished_buildings = [f for f in filtered if f["type"] == 'Building']
-            finished_units = [f for f in filtered if f["type"] == 'Unit']
-            finished_ages = [f for f in filtered if f["type"] == 'Age']
-            finished_animals = [f for f in filtered if f["type"] == 'Animal']
-            finished_upgrades = [f for f in filtered if f["type"] == 'Upgrade']
+            filtered_unit = [e for e in events if e["time"] <= time and e["time"] > last_time and e["type"] == 'Unit' and e["event"] == 'FINISH' and e["entity"] != 'Villager']
+            filtered_buildings = [e for e in events 
+                                  if e["time"] <= time and e["time"] > last_time 
+                                  and e["type"] == 'Building' 
+                                  and (e["event"] == 'BUILD' or e['event'] == 'CONSTRUCT')
+                                ]
+            
+            filtered_animals = [e for e in events if e["time"] <= time and e["time"] > last_time and e["type"] == 'Animal' and e["event"] == 'FINISH']
+            filtered_age = [e for e in events if e["time"] <= time and e["time"] > last_time and e["type"] == 'Age' and e["event"] == 'FINISH']
             
             bo = {
-                "finished_buildings": ";".join(f["entity"] for f in finished_buildings),
-                "finished_units": ";".join(f["entity"] for f in finished_units),
-                "finished_ages": ";".join(f["entity"] for f in finished_ages),
-                "finished_animals": ";".join(f["entity"] for f in finished_animals),
-                "finished_upgrades": ";".join(f["entity"] for f in finished_upgrades)
+                "finished_buildings": ";".join(f["entity"] for f in filtered_unit),
+                "finished_units": ";".join(f["entity"] for f in filtered_buildings),
+                "finished_ages": ";".join(f["entity"] for f in filtered_animals),
+                "finished_animals": ";".join(f["entity"] for f in filtered_age),
+                # "finished_upgrades": ";".join(f["entity"] for f in finished_upgrades)
             }
 
             data_row.append(
@@ -487,7 +489,7 @@ def prepare_transformer_csv(files, out_csv: str) -> None:
     groups = split_events_array_by_player(all_events)
 
     with open(out_csv, 'w', newline='', encoding='utf-8') as out:
-        writer = csv.DictWriter(out, fieldnames=['game_id', 'profile_id', 'player_civ', 'enemy_civ', 'map', 'player_result', 'player_won', 'wood', 'food', 'gold', 'stone', 'wood_per_min', 'food_per_min', 'gold_per_min', 'stone_per_min',  'military', 'economy', 'technology', 'society', 'oliveoil', 'oliveoil_per_min','villager_delta', 'time', 'phase', 'age', 'finished_buildings', 'finished_units','finished_ages', 'finished_animals', 'finished_upgrades', 'strat']   )
+        writer = csv.DictWriter(out, fieldnames=['game_id', 'profile_id', 'player_civ', 'enemy_civ', 'map', 'player_result', 'player_won', 'wood', 'food', 'gold', 'stone', 'wood_per_min', 'food_per_min', 'gold_per_min', 'stone_per_min',  'military', 'economy', 'technology', 'society', 'oliveoil', 'oliveoil_per_min','villager_delta', 'time', 'phase', 'age', 'finished_buildings', 'finished_units','finished_ages', 'finished_animals', 'strat']   )
         writer.writeheader()
         for ev in all_events:
             writer.writerow(ev)
