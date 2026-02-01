@@ -2,7 +2,6 @@ import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from StrategyDiscoverySupervised.dataset_resource_based import GameSequenceDatasetResourceBased
-from StrategyDiscoverySupervised.dataset_event_based import GameSequenceDatasetEventBased
 from model import StrategyGRU
 from tqdm import tqdm
 import wandb
@@ -57,7 +56,6 @@ LABEL_SMOOTHING=0.04
 # CLASS_SCALE = 0.8
 CLASS_WEIGHT_METHODE = 'sqr'
 WEIGHT_DECAY = 0.01
-DATASET = 'event_based'
 
 
 def add_noise(tensor, noise_level=0.01):
