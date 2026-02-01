@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from dataset2 import GameSequenceDataset2
+from StrategyDiscoverySupervised.dataset_resource_based import GameSequenceDataset2
 from model import StrategyGRU
 import numpy as np
 from sklearn.metrics import confusion_matrix, classification_report, accuracy_score

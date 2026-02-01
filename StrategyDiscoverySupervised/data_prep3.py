@@ -18,6 +18,8 @@ import math
 from collections import defaultdict
 from typing import Dict
 
+CSV_RESOURCE_BASED = False
+
 def _phase_from_time(t: int) -> str:
     """Return phase label for a timestamp (seconds).
     EARLY: 0 - 8 min (0-480s)
@@ -258,6 +260,85 @@ def calculate_strat_from_data(build_events: list, resource_data: Dict, age_up_ti
         strat_label = 'unknown'
     return strat_label
 
+def generate_resource_based(resource_snapshot, age_up_times, meta_data, build_order, events, strat_label):
+    
+    last_time = 0
+    data_row = []
+    for time, snap_shot in resource_snapshot.items(): 
+        age = get_age_from_data(age_up_times, time)
+
+        if time > 900 or age == 'IMPERIAL':
+            break
+
+        resource_data = snap_shot.copy()
+
+        num_finished = 0
+        num_destroyed = 0
+        for item in build_order:
+            icon = item.get('icon') or ''
+            entity = _clean_entity_from_icon(icon)
+
+            if entity != 'Villager':
+                continue
+
+            from bisect import bisect_right, bisect_left
+            num_finished = bisect_right(item.get('finished'), time) - bisect_left(item.get('finished'), last_time) or 0
+            num_destroyed = bisect_right(item.get('finished'), time) - bisect_left(item.get('finished'), last_time) or 0
+
+        villager_delta = num_finished - num_destroyed
+        # seperate into unit, building, age, animal, upgrade, 
+        filtered_unit = [e for e in events if e["time"] <= time and e["time"] > last_time and e["type"] == 'Unit' and e["event"] == 'FINISH' and e["entity"] != 'Villager']
+        filtered_buildings = [e for e in events 
+                                if e["time"] <= time and e["time"] > last_time 
+                                and e["type"] == 'Building' 
+                                and (e["event"] == 'BUILD' or e['event'] == 'CONSTRUCT')
+                            ]
+        
+        filtered_animals = [e for e in events if e["time"] <= time and e["time"] > last_time and e["type"] == 'Animal' and e["event"] == 'FINISH']
+        filtered_age = [e for e in events if e["time"] <= time and e["time"] > last_time and e["type"] == 'Age' and e["event"] == 'FINISH']
+        
+        bo = {
+            "finished_buildings": ";".join(f["entity"] for f in filtered_unit),
+            "finished_units": ";".join(f["entity"] for f in filtered_buildings),
+            "finished_ages": ";".join(f["entity"] for f in filtered_animals),
+            "finished_animals": ";".join(f["entity"] for f in filtered_age),
+            # "finished_upgrades": ";".join(f["entity"] for f in finished_upgrades)
+        }
+
+        data_row.append(
+            meta_data | 
+            resource_data |  
+            {'villager_delta': villager_delta, 'time': time, 'phase': _phase_from_time(time), 'age': age} |
+            bo |
+            {'strat': strat_label}
+        )  
+
+        last_time = time
+    return data_row
+
+
+def generate_event_based(build_order, meta_data, age_up_times, strat_label):
+    last_time = 0
+    data_row = []
+    for bo in build_order: 
+        time = bo['time']
+        age = get_age_from_data(age_up_times, time)
+        
+        if time > 900 or age == 'IMPERIAL':
+            break
+
+        villager_delta = 0
+        for item in build_order:
+            if item['entity'] != 'Villager' or time < item['time']:
+                continue
+
+            if item['event'] == 'FINISH':
+                villager_delta += 1
+            elif item['event'] == 'DESTROY':
+                villager_delta -= 1
+
+        data_row.append( meta_data | bo | { 'age': age, 'villagers': villager_delta, 'strat': strat_label })
+    return data_row
 
 
 def extract_events_from_obj(obj: dict):
@@ -376,8 +457,6 @@ def extract_events_from_obj(obj: dict):
                         'time': t,
                     })
 
-        last_time = 0
-        data_row = []
         
         age_up_times = get_age_up_times(player.get('actions') or {})
         strat_label = calculate_strat_from_data(events, resource_snapshot, age_up_times)
@@ -385,65 +464,21 @@ def extract_events_from_obj(obj: dict):
             print(f"[INFO] Skipping unknown strat for game_id={game_id}, profile_id={profile_id}")
             continue
 
-        for time, snap_shot in resource_snapshot.items(): 
-            age = get_age_from_data(age_up_times, time)
-
-            if time > 900 or age == 'IMPERIAL':
-                break
-
-            resource_data = snap_shot.copy()
-            meta_data = {
-                'game_id': game_id,
-                'profile_id': profile_id,
-                'player_civ': player_civ,
-                'enemy_civ': enemy_civs,
-                'map': game_map,
-                'player_result': res_norm,
-                'player_won': 1 if won_flag else 0,
-            }
-
-            num_finished = 0
-            num_destroyed = 0
-            for item in build_order:
-                icon = item.get('icon') or ''
-                entity = _clean_entity_from_icon(icon)
-
-                if entity != 'Villager':
-                    continue
-
-                from bisect import bisect_right, bisect_left
-                num_finished = bisect_right(item.get('finished'), time) - bisect_left(item.get('finished'), last_time) or 0
-                num_destroyed = bisect_right(item.get('finished'), time) - bisect_left(item.get('finished'), last_time) or 0
-
-            villager_delta = num_finished - num_destroyed
-            # seperate into unit, building, age, animal, upgrade, 
-            filtered_unit = [e for e in events if e["time"] <= time and e["time"] > last_time and e["type"] == 'Unit' and e["event"] == 'FINISH' and e["entity"] != 'Villager']
-            filtered_buildings = [e for e in events 
-                                  if e["time"] <= time and e["time"] > last_time 
-                                  and e["type"] == 'Building' 
-                                  and (e["event"] == 'BUILD' or e['event'] == 'CONSTRUCT')
-                                ]
+        meta_data = {
+            'game_id': game_id,
+            'profile_id': profile_id,
+            'player_civ': player_civ,
+            'enemy_civ': enemy_civs,
+            'map': game_map,
+            'player_result': res_norm,
+            'player_won': 1 if won_flag else 0,
+        }
             
-            filtered_animals = [e for e in events if e["time"] <= time and e["time"] > last_time and e["type"] == 'Animal' and e["event"] == 'FINISH']
-            filtered_age = [e for e in events if e["time"] <= time and e["time"] > last_time and e["type"] == 'Age' and e["event"] == 'FINISH']
-            
-            bo = {
-                "finished_buildings": ";".join(f["entity"] for f in filtered_unit),
-                "finished_units": ";".join(f["entity"] for f in filtered_buildings),
-                "finished_ages": ";".join(f["entity"] for f in filtered_animals),
-                "finished_animals": ";".join(f["entity"] for f in filtered_age),
-                # "finished_upgrades": ";".join(f["entity"] for f in finished_upgrades)
-            }
-
-            data_row.append(
-                meta_data | 
-                resource_data |  
-                {'villager_delta': villager_delta, 'time': time, 'phase': _phase_from_time(time), 'age': age} |
-                bo |
-                {'strat': strat_label}
-            )  
-
-            last_time = time
+        data_row = []
+        if CSV_RESOURCE_BASED == True:
+            data_row = generate_resource_based(resource_snapshot, age_up_times, meta_data, build_order, events, strat_label)
+        else:
+            data_row = generate_event_based(events, meta_data, age_up_times, strat_label)
 
         evs.extend(data_row)   
     return evs
@@ -489,7 +524,9 @@ def prepare_transformer_csv(files, out_csv: str) -> None:
     groups = split_events_array_by_player(all_events)
 
     with open(out_csv, 'w', newline='', encoding='utf-8') as out:
-        writer = csv.DictWriter(out, fieldnames=['game_id', 'profile_id', 'player_civ', 'enemy_civ', 'map', 'player_result', 'player_won', 'wood', 'food', 'gold', 'stone', 'wood_per_min', 'food_per_min', 'gold_per_min', 'stone_per_min',  'military', 'economy', 'technology', 'society', 'oliveoil', 'oliveoil_per_min','villager_delta', 'time', 'phase', 'age', 'finished_buildings', 'finished_units','finished_ages', 'finished_animals', 'strat']   )
+        #meta_data | bo | { 'age': age, 'villagers': villager_delta, 'strat': strat_label }
+        writer = csv.DictWriter(out, fieldnames=['game_id', 'profile_id', 'player_civ', 'enemy_civ', 'map', 'player_result', 'player_won', 'event', 'entity', 'type', 'time', 'villagers', 'age', 'strat']   )
+        # writer = csv.DictWriter(out, fieldnames=['game_id', 'profile_id', 'player_civ', 'enemy_civ', 'map', 'player_result', 'player_won', 'wood', 'food', 'gold', 'stone', 'wood_per_min', 'food_per_min', 'gold_per_min', 'stone_per_min',  'military', 'economy', 'technology', 'society', 'oliveoil', 'oliveoil_per_min','villager_delta', 'time', 'phase', 'age', 'finished_buildings', 'finished_units','finished_ages', 'finished_animals', 'strat']   )
         writer.writeheader()
         for ev in all_events:
             writer.writerow(ev)

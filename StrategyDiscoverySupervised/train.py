@@ -1,7 +1,8 @@
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from dataset2 import GameSequenceDataset2
+from StrategyDiscoverySupervised.dataset_resource_based import GameSequenceDatasetResourceBased
+from StrategyDiscoverySupervised.dataset_event_based import GameSequenceDatasetEventBased
 from model import StrategyGRU
 from tqdm import tqdm
 import wandb
@@ -56,6 +57,7 @@ LABEL_SMOOTHING=0.04
 # CLASS_SCALE = 0.8
 CLASS_WEIGHT_METHODE = 'sqr'
 WEIGHT_DECAY = 0.01
+DATASET = 'event_based'
 
 
 def add_noise(tensor, noise_level=0.01):
@@ -351,7 +353,7 @@ def main():
         }
     )
 
-    dataset = GameSequenceDataset2(csv_path, seq_len=seq_len)
+    dataset = GameSequenceDatasetResourceBased(csv_path, seq_len=seq_len)
     
     # Extract targets from sequences for class distribution analysis
     dataset_targets = [seq['target'] for seq in dataset.sequences]

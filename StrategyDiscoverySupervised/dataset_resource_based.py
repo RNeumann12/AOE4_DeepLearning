@@ -5,7 +5,7 @@ import numpy as np
 from tqdm import tqdm
 
 
-class GameSequenceDataset2(Dataset):
+class GameSequenceDatasetResourceBased(Dataset):
     """
     Enhanced PyTorch Dataset for AoE4 player sequences.
     
@@ -260,7 +260,7 @@ class GameSequenceDataset2(Dataset):
 
 if __name__ == "__main__":
     # Test the dataset
-    dataset = GameSequenceDataset2('transformer_input_test_v2.csv', seq_len=50)
+    dataset = GameSequenceDatasetResourceBased('transformer_input_test_v2.csv', seq_len=50)
     print(f"\n✓ Dataset created successfully!")
     print(f"Total samples: {len(dataset)}")
     
