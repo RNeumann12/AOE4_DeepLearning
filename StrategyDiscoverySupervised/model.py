@@ -43,6 +43,8 @@ class StrategyGRU(nn.Module):
             dropout=dropout if num_layers > 1 else 0
         )
 
+        self.dropout = nn.Dropout(0.5) 
+
         self.attn = nn.Linear(hidden_size * 2, 1)
         
         # Context features size: 4 embeddings of hidden_size//4 each
@@ -79,7 +81,9 @@ class StrategyGRU(nn.Module):
         # Concatenate numeric and event features
         x = torch.cat([x_numeric, x_events], dim=-1)  # [batch_size, seq_len, hidden_size*2]
 
-        gru_out, _ = self.gru(x)  # [batch_size, seq_len, hidden_size*2]
+        gru_out, hidden  = self.gru(x)  # [batch_size, seq_len, hidden_size*2]
+
+        gru_out = self.dropout(gru_out) 
 
         attn_scores = self.attn(gru_out).squeeze(-1)  # [batch_size, seq_len]
         if mask is not None:

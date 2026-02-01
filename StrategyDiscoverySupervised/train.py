@@ -9,7 +9,8 @@ import numpy as np
 from sklearn.metrics import confusion_matrix, classification_report, precision_recall_fscore_support
 import matplotlib.pyplot as plt
 import seaborn as sns
-
+from torch.utils.data import WeightedRandomSampler
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 
 class LabelSmoothingLoss(nn.Module):
     """Cross-entropy with label smoothing for better regularization and class balance"""
@@ -44,11 +45,26 @@ class LabelSmoothingLoss(nn.Module):
         return loss.mean()
 
 CSV_PATH = 'transformer_input_test_v2.csv'
-SEQ_LEN = 50
-BATCH_SIZE = 128
+SEQ_LEN = 100
+BATCH_SIZE = 32
 NUM_EPOCHS = 50
-LEARNING_RATE = 6e-4
-HIDDEN_SIZE = 128
+LEARNING_RATE = 7e-4
+HIDDEN_SIZE = 64
+NUM_LAYERS = 2
+DROPOUT = 0.5
+LABEL_SMOOTHING=0.04
+# CLASS_SCALE = 0.8
+CLASS_WEIGHT_METHODE = 'sqr'
+WEIGHT_DECAY = 0.01
+
+
+def add_noise(tensor, noise_level=0.01):
+    """Add Gaussian noise to tensor during training"""
+    if tensor is None:
+        return tensor
+    noise = torch.randn_like(tensor) * noise_level
+    return tensor + noise
+
 
 def train_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
@@ -71,12 +87,15 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         age = age.to(device)
         targets = targets.to(device).long()
 
+        numeric_seq = add_noise(numeric_seq, noise_level=0.01)
+        time_seq = add_noise(time_seq, noise_level=0.01)
         optimizer.zero_grad()
         
         logits, _ = model(numeric_seq, event_seq, mask, time_seq, player_civ, enemy_civ, map_id, age)
         loss = criterion(logits, targets)
 
         loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
         optimizer.step()
 
         total_loss += loss.item()
@@ -206,16 +225,16 @@ def log_classification_metrics(preds, targets, dataset, split_name):
             int(support[class_idx])
         ])
     
-    table = wandb.Table(
-        data=metrics_data,
-        columns=[
-            "Strategy", "TP", "FP", "FN", "TN",
-            "TPR", "FPR", "FNR",
-            "Precision", "Recall", "F1-Score", "Support"
-        ]
-    )
+    # table = wandb.Table(
+    #     data=metrics_data,
+    #     columns=[
+    #         "Strategy", "TP", "FP", "FN", "TN",
+    #         "TPR", "FPR", "FNR",
+    #         "Precision", "Recall", "F1-Score", "Support"
+    #     ]
+    # )
     
-    wandb.log({f"{split_name}/Per-Class Detailed Metrics": table})
+    # wandb.log({f"{split_name}/Per-Class Detailed Metrics": table})
     
     # Log macro and weighted averages
     macro_f1 = np.mean(f1)
@@ -269,9 +288,9 @@ def log_confidence_metrics(preds, targets, confidences, dataset, split_name):
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
     
-    plt.tight_layout()
-    wandb.log({f"{split_name}/Confidence Distributions": wandb.Image(fig)})
-    plt.close()
+    # plt.tight_layout()
+    # # wandb.log({f"{split_name}/Confidence Distributions": wandb.Image(fig)})
+    # plt.close()
     
     # Per-class confidence statistics
     idx_to_strat = {v: k for k, v in dataset.strat_vocab.items()}
@@ -297,11 +316,11 @@ def log_confidence_metrics(preds, targets, confidences, dataset, split_name):
                 int(class_mask.sum())
             ])
     
-    conf_table = wandb.Table(
-        data=confidence_data,
-        columns=["Strategy", "Avg Confidence", "Min Confidence", "Max Confidence", "Correct Avg Confidence", "Count"]
-    )
-    wandb.log({f"{split_name}/Per-Class Confidence Stats": conf_table})
+    # conf_table = wandb.Table(
+    #     data=confidence_data,
+    #     columns=["Strategy", "Avg Confidence", "Min Confidence", "Max Confidence", "Correct Avg Confidence", "Count"]
+    # )
+    # wandb.log({f"{split_name}/Per-Class Confidence Stats": conf_table})
 
 def main():
     csv_path = CSV_PATH
@@ -310,8 +329,10 @@ def main():
     num_epochs = NUM_EPOCHS
     learning_rate = LEARNING_RATE
     hidden_size = HIDDEN_SIZE
+    num_layers = NUM_LAYERS
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
     # device = torch.device('cpu')
 
     # Clear any cached memory before starting
@@ -350,43 +371,137 @@ def main():
         print(f"{class_name:<30} {class_id:<12} {count:<12} {percentage:>10.1f}%")
     
     # Calculate class weights (inverse frequency) to handle imbalance
-    class_weights = torch.zeros(len(dataset.strat_vocab))
-    for class_id, count in zip(unique_classes, class_counts):
-        # Weight inversely proportional to frequency
-        class_weights[class_id] = len(dataset) / (len(dataset.strat_vocab) * count)
+    if CLASS_WEIGHT_METHODE == 'inverse':
+        weights  = 1 / class_counts
+    elif CLASS_WEIGHT_METHODE == 'sqr':
+        weights = 1.0 / class_counts ** 0.25 #np.sqrt(class_counts)
+    weights = weights / weights.sum() * len(weights)
+    print(f"Class weights: {weights}")
+    class_weights = torch.FloatTensor(weights).to(device)
     
-    # Normalize weights
-    class_weights = class_weights / class_weights.sum() * len(dataset.strat_vocab)
     print(f"\nClass weights for loss function:")
     print(f"{'Strategy Name':<30} {'Weight':<15}")
     print("=" * 45)
     for class_id in range(len(dataset.strat_vocab)):
         class_name = idx_to_strat[class_id]
         print(f"{class_name:<30} {class_weights[class_id]:.4f}")
+
+    # Log class distribution and class weights to W&B (table + bar chart)
+    # Prepare counts per class
+    counts_by_class = [0] * len(dataset.strat_vocab)
+    for cid, cnt in zip(unique_classes, class_counts):
+        counts_by_class[cid] = int(cnt)
+
+    # Build table data
+    table_data = []
+    for class_id in range(len(dataset.strat_vocab)):
+        class_name = idx_to_strat[class_id]
+        count = counts_by_class[class_id]
+        percentage = (count / len(dataset)) * 100 if len(dataset) > 0 else 0.0
+        weight = float(class_weights[class_id].item()) if hasattr(class_weights[class_id], 'item') else float(class_weights[class_id])
+        table_data.append([class_name, class_id, count, f"{percentage:.2f}", weight])
+
+    # table = wandb.Table(
+    #     data=table_data,
+    #     columns=["Strategy", "Class ID", "Count", "Percentage", "Weight"]
+    # )
+    # wandb.log({"Dataset/Class Distribution": table})
+
+    # Bar chart of class counts
+    fig, ax = plt.subplots(figsize=(12, 6))
+    labels = [idx_to_strat[i] for i in range(len(dataset.strat_vocab))]
+    ax.bar(labels, counts_by_class, color='tab:blue', edgecolor='black')
+    ax.set_xticklabels(labels, rotation=45, ha='right')
+    ax.set_ylabel('Count')
+    ax.set_title('Class Distribution (Counts)')
+    plt.tight_layout()
+    wandb.log({"Dataset/Class Distribution (Chart)": wandb.Image(fig)})
+    plt.close()
     
     train_size = int(0.8 * len(dataset))
     val_size = len(dataset) - train_size
     train_dataset, val_dataset = torch.utils.data.random_split(dataset, [train_size, val_size])
+    print(f"Training samples: {len(train_dataset)}")
+    print(f"Validation samples: {len(val_dataset)}")
+    
+    # # Build class count map
+    # class_count_map = {cid: count for cid, count in zip(unique_classes, class_counts)}
 
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    # # Compute log-damped per-sample weights: w = log(1 + N/count)
+    # total_samples = len(dataset)
+    # sample_weights_all = np.array([np.log(1.0 + total_samples / class_count_map[seq['target']]) for seq in dataset.sequences])
+
+    # # Cap extreme weights using milder 5th/95th percentiles to avoid aggressive clipping
+    # clip_low_pct = 5
+    # clip_high_pct = 95
+    # low_clip = float(np.percentile(sample_weights_all, clip_low_pct))
+    # high_clip = float(np.percentile(sample_weights_all, clip_high_pct))
+    # sample_weights_clipped = np.clip(sample_weights_all, low_clip, high_clip)
+
+    # # Identify very rare classes and apply a small boost to their sample weights so they're not dropped entirely
+    # rare_class_threshold = 0.10  # classes with <10% of samples are considered rare
+    # rare_boost_factor = 1.25
+    # rare_classes = [cid for cid, cnt in class_count_map.items() if (cnt / total_samples) < rare_class_threshold]
+
+    # sample_weights_boosted = sample_weights_clipped.copy()
+    # for rc in rare_classes:
+    #     mask = np.array([1 if seq['target'] == rc else 0 for seq in dataset.sequences], dtype=bool)
+    #     sample_weights_boosted[mask] = sample_weights_boosted[mask] * rare_boost_factor
+
+    # # Log clipping info, boosted classes and distribution to W&B
+    # wandb.log({
+    #     "Sampler/weights_raw_min": float(sample_weights_all.min()),
+    #     "Sampler/weights_raw_max": float(sample_weights_all.max()),
+    #     "Sampler/weights_clip_low": low_clip,
+    #     "Sampler/weights_clip_high": high_clip,
+    #     "Sampler/rare_classes": str(rare_classes),
+    #     "Sampler/rare_boost_factor": rare_boost_factor
+    # })
+
+    # fig_sw, ax_sw = plt.subplots(figsize=(8, 4))
+    # ax_sw.hist(sample_weights_all, bins=50, alpha=0.5, label='raw', color='gray')
+    # ax_sw.hist(sample_weights_boosted, bins=50, alpha=0.7, label='boosted', color='tab:blue')
+    # ax_sw.legend()
+    # ax_sw.set_title('Sampler Weights: Raw vs Boosted/Clipped')
+    # plt.tight_layout()
+    # wandb.log({"Sampler/Weights Distribution": wandb.Image(fig_sw)})
+    # plt.close()
+
+    # # For train subset, pick weights for its indices (use boosted weights)
+    # train_indices = train_dataset.indices  # Subset
+    # train_weights = [float(sample_weights_boosted[i]) for i in train_indices]
+
+    sampler = WeightedRandomSampler(class_weights , num_samples=len(class_weights ), replacement=True)
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
     val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
 
     model = StrategyGRU(
         num_numeric=len(dataset.NUMERICAL_COLS),
         num_events=len(dataset.event_vocab),
         hidden_size=hidden_size,
-        num_layers=2,
+        num_layers=num_layers,
         num_classes=len(dataset.strat_vocab),
-        dropout=0.26,
+        dropout=DROPOUT,
         num_civs=len(dataset.civ_vocab),
         num_enemy_civs=len(dataset.enemy_civ_vocab),
         num_maps=len(dataset.map_vocab),
         num_ages=len(dataset.age_vocab) if dataset.age_vocab else 1
     ).to(device)
 
-    criterion = LabelSmoothingLoss(num_classes=len(dataset.strat_vocab), smoothing=0.09, weight=class_weights.to(device))
-    optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
+    # If using a WeightedRandomSampler, do NOT use class weights in the loss (sampler balances classes)
+    # use_sampler = 'sampler' in locals()
+    # if use_sampler:
+    #     print("Using WeightedRandomSampler: disabling class weights in loss to avoid overcompensation.")
+    #     # wandb.log({"Loss/Using Class Weights": False})
+    #     criterion = LabelSmoothingLoss(num_classes=len(dataset.strat_vocab), smoothing=LABEL_SMOOTHING, weight=None)
+    # else:
+    #     # wandb.log({"Loss/Using Class Weights": True})
+    #     criterion = LabelSmoothingLoss(num_classes=len(dataset.strat_vocab), smoothing=LABEL_SMOOTHING, weight=class_weights.to(device))
+
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate, weight_decay=WEIGHT_DECAY)
     
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5)
     # Track metrics for plotting
     train_losses = []
     val_losses = []
@@ -415,7 +530,8 @@ def main():
         val_losses.append(val_loss)
         train_accs.append(train_acc)
         val_accs.append(val_acc)
-        
+
+        scheduler.step(val_loss)        
         wandb.log({
             "Train Loss (raw)": train_loss,
             "Train Accuracy": train_acc,
@@ -439,15 +555,15 @@ def main():
             patience_counter = 0
             best_model_state = model.state_dict().copy()
             print(f"  ✓ Best validation accuracy: {best_val_acc:.4f}")
-        else:
-            patience_counter += 1
-            print(f"  ✗ No improvement. Patience: {patience_counter}/{patience}")
+        # else:
+        #     patience_counter += 1
+        #     print(f"  ✗ No improvement. Patience: {patience_counter}/{patience}")
             
-            if patience_counter >= patience:
-                print(f"\n🛑 Early stopping triggered at epoch {epoch}")
-                print(f"Best validation accuracy was: {best_val_acc:.4f}")
-                model.load_state_dict(best_model_state)
-                break
+        #     if patience_counter >= patience:
+        #         print(f"\n🛑 Early stopping triggered at epoch {epoch}")
+        #         print(f"Best validation accuracy was: {best_val_acc:.4f}")
+        #         model.load_state_dict(best_model_state)
+        #         break
         
         # Log confusion matrices every epoch
         if True:

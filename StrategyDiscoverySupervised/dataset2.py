@@ -29,7 +29,7 @@ class GameSequenceDataset2(Dataset):
     # Numerical/resource columns
     NUMERICAL_COLS = [
         #'food', 'wood', 'gold', 'stone', 
-        'military', 'economy', 'technology', 'society',
+        # 'military', 'economy', 'technology', 'society',
         # 'food_per_min', 'wood_per_min', 'gold_per_min', 'stone_per_min',
         'villager_delta', 
         #'oliveoil', 'oliveoil_per_min'
