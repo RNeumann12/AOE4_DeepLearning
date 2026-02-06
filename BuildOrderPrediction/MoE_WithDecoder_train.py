@@ -18,6 +18,14 @@ Usage:
   python BuildOrderPrediction/MoE_WithDecoder_train.py
   python BuildOrderPrediction/MoE_WithDecoder_train.py --wins_only --max_seq_len 50 --csv_path training_data_2026_01.csv 
 
+
+  Last run parameters:
+python BuildOrderPrediction/MoE_WithDecoder_train.py \
+  --wins_only --max_seq_len 50 --csv_path training_data_2026_01.csv \
+  --d_model 768 --nhead 12 --num_decoder_layers 10 --dim_feedforward 3072 \
+  --batch_size 64 --grad_accum_steps 4 --dropout 0.1 \
+  --num_experts 8 --use_moe --use_ngram --use_rope --use_contrastive \
+  --teacher_forcing_ratio 1.0 --epochs 70
   """
 
 class FocalLoss(nn.Module):
@@ -44,6 +52,11 @@ class FocalLoss(nn.Module):
             input = input.reshape(-1, c)
             target = target.reshape(-1)
 
+        # Clamp logits for numerical stability before softmax
+        # This prevents -inf values (from civ masking) creating NaN in fp16
+        input = input.float()  # Always compute loss in fp32
+        input = torch.clamp(input, min=-1e4)
+        
         log_pt = F.log_softmax(input, dim=-1)
         pt = torch.exp(log_pt)
         
@@ -51,7 +64,9 @@ class FocalLoss(nn.Module):
         ce_loss = F.nll_loss(log_pt, target, reduction='none', ignore_index=self.ignore_index)
         
         # Calculate modulating factor: (1 - pt)^gamma
-        pt_gather = pt.gather(1, target.unsqueeze(1)).squeeze(1)
+        # Use safe target for gathering (replace ignore_index with 0 to avoid OOB)
+        safe_target_for_pt = torch.where(target != self.ignore_index, target, torch.zeros_like(target))
+        pt_gather = pt.gather(1, safe_target_for_pt.unsqueeze(1)).squeeze(1)
         modulating_factor = (1 - pt_gather) ** self.gamma
         
         # Apply alpha weighting if provided
@@ -390,7 +405,7 @@ class TransformerDecoderBlock(nn.Module):
     Enhanced transformer decoder block with:
     - Pre-norm architecture
     - Causal self-attention
-    - Cross-attention to encoder memory
+    - Cross-attention to condition memory (NOT an encoder - just MLP-projected conditions)
     - Gated residual connections
     - Optional local attention
     """
@@ -405,7 +420,7 @@ class TransformerDecoderBlock(nn.Module):
         )
         self.dropout1 = nn.Dropout(dropout)
         
-        # Cross-attention to encoder memory
+        # Cross-attention to condition memory
         self.norm2 = nn.LayerNorm(d_model)
         self.cross_attn = nn.MultiheadAttention(
             d_model, nhead, dropout=dropout, batch_first=True
@@ -438,14 +453,14 @@ class TransformerDecoderBlock(nn.Module):
                 tgt_key_padding_mask: Optional[torch.Tensor] = None,
                 memory_key_padding_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
         """
-        Apply decoder block with cross-attention to encoder memory.
+        Apply decoder block with cross-attention to condition memory.
         
         Args:
             x: (B, L_tgt, d_model) decoder input
-            memory: (B, L_mem, d_model) encoder output
+            memory: (B, L_mem, d_model) condition memory (MLP-projected conditions)
             tgt_mask: causal mask for self-attention
             tgt_key_padding_mask: padding mask for decoder input
-            memory_key_padding_mask: padding mask for encoder output
+            memory_key_padding_mask: padding mask for condition memory
         """
         # Causal self-attention
         x_norm = self.norm1(x)
@@ -454,7 +469,7 @@ class TransformerDecoderBlock(nn.Module):
                                       key_padding_mask=tgt_key_padding_mask)
         x = x + self.gate1 * self.dropout1(attn_out)
         
-        # Cross-attention to encoder memory
+        # Cross-attention to condition memory
         x_norm = self.norm2(x)
         cross_out, _ = self.cross_attn(x_norm, memory, memory,
                                         key_padding_mask=memory_key_padding_mask)
@@ -474,22 +489,27 @@ class TransformerDecoderBlock(nn.Module):
 
 class SequencePredictor(nn.Module):
     """
-    Enhanced Encoder-Decoder Transformer for entity build order prediction.
+    Conditional Decoder Transformer for entity build order prediction.
     
     Architecture:
-    - Encoder: Processes conditions (player civ, enemy civ, map) into memory
-    - Decoder: Autoregressively generates entity sequence with cross-attention to encoder
+    - Condition Projection: MLP that combines (player_civ, enemy_civ, map) into a single memory vector
+    - Decoder: Autoregressively generates entity sequence with cross-attention to condition memory
+    
+    NOTE: This is NOT an encoder-decoder architecture. The "condition projection" is just an MLP,
+    not a transformer encoder. Self-attention on a single token (the condition vector) would be
+    a no-op, so we removed the useless encoder transformer layers. The decoder cross-attends to
+    the projected condition vector at every layer.
     
     Key improvements over basic transformer:
     1. Rotary Position Embeddings (RoPE) for better relative position modeling
-    2. Gated cross-attention for condition fusion
+    2. Gated cross-attention for condition fusion at every decoder layer
     3. N-gram feature extraction for local patterns
     4. Mixture of Experts for specialized processing
-    5. Multi-scale attention (local + global) in both encoder and decoder
+    5. Multi-scale attention (local + global) in decoder
     6. Contrastive representation learning auxiliary objective
     7. Gated residual connections for training stability
     8. Deep output head with skip connection
-    9. Encoder-decoder architecture with cross-attention
+    9. Per-layer map cross-attention for persistent map influence
     """
     
     def __init__(self,
@@ -498,7 +518,6 @@ class SequencePredictor(nn.Module):
                  map_vocab_size: int,
                  d_model: int = 256,
                  nhead: int = 8,
-                 num_encoder_layers: int = 4,
                  num_decoder_layers: int = 6,
                  dim_feedforward: int = 1024,
                  dropout: float = 0.15,
@@ -515,7 +534,6 @@ class SequencePredictor(nn.Module):
         self.use_moe = use_moe
         self.use_ngram = use_ngram
         self.use_rope = use_rope
-        self.num_encoder_layers = num_encoder_layers
         self.num_decoder_layers = num_decoder_layers
         
         # 1. Entity embedding with scaling
@@ -527,12 +545,18 @@ class SequencePredictor(nn.Module):
         self.enemy_civ_embed = nn.Embedding(civ_vocab_size, d_model)
         self.map_embed = nn.Embedding(map_vocab_size, d_model)
         
-        # Condition projection (combine all conditions)
+        # Condition projection MLP (combine all conditions into a single memory vector)
+        # NOTE: This replaces what was previously called an "encoder". Self-attention on a
+        # single token is a no-op, so we just use an MLP to project the concatenated conditions.
+        # The decoder cross-attends to this projected condition vector at every layer.
         self.condition_proj = nn.Sequential(
             nn.Linear(d_model * 3, d_model * 2),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(d_model * 2, d_model)
+            nn.Linear(d_model * 2, d_model),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(d_model, d_model)  # Extra layer for more expressive condition encoding
         )
         
         # 3. Position embeddings (with optional RoPE)
@@ -552,30 +576,10 @@ class SequencePredictor(nn.Module):
         self.embed_ln = nn.LayerNorm(d_model)
         self.embed_dropout = nn.Dropout(dropout)
         
-        # 7. ENCODER: Improved transformer layers with alternating local/global attention
-        self.encoder_layers = nn.ModuleList([
-            ImprovedTransformerBlock(
-                d_model=d_model,
-                nhead=nhead,
-                dim_feedforward=dim_feedforward,
-                dropout=dropout,
-                use_local_attn=(i % 2 == 0)  # Alternate local attention
-            )
-            for i in range(num_encoder_layers)
-        ])
+        # 7. Condition output layer norm (applied after condition projection)
+        self.condition_output_ln = nn.LayerNorm(d_model)
         
-        # 8. Encoder Mixture of Experts (applied every other layer)
-        if use_moe:
-            self.encoder_moe_layers = nn.ModuleList([
-                MixtureOfExperts(d_model, num_experts=num_experts, dropout=dropout)
-                if i % 2 == 1 else None
-                for i in range(num_encoder_layers)
-            ])
-        
-        # 9. Encoder output layer norm
-        self.encoder_output_ln = nn.LayerNorm(d_model)
-        
-        # 10. DECODER: Transformer decoder layers with cross-attention to encoder
+        # 8. DECODER: Transformer decoder layers with cross-attention to condition memory
         self.decoder_layers = nn.ModuleList([
             TransformerDecoderBlock(
                 d_model=d_model,
@@ -587,7 +591,7 @@ class SequencePredictor(nn.Module):
             for i in range(num_decoder_layers)
         ])
         
-        # 11. Decoder Mixture of Experts (applied every other layer)
+        # 9. Decoder Mixture of Experts (applied every other layer)
         if use_moe:
             self.decoder_moe_layers = nn.ModuleList([
                 MixtureOfExperts(d_model, num_experts=num_experts, dropout=dropout)
@@ -595,7 +599,7 @@ class SequencePredictor(nn.Module):
                 for i in range(num_decoder_layers)
             ])
         
-        # 11b. Map-specific cross-attention for each decoder layer (FIX for map embedding)
+        # 10. Map-specific cross-attention for each decoder layer
         # This ensures map information is explicitly used at every decoder layer
         self.map_cross_attn_layers = nn.ModuleList([
             GatedCrossAttention(d_model, nhead, dropout)
@@ -605,10 +609,10 @@ class SequencePredictor(nn.Module):
         # Map influence gate (learnable weight for map contribution)
         self.map_influence_gate = nn.Parameter(torch.tensor(0.2))  # Initial 20% influence
         
-        # 12. Decoder output layer norm
+        # 11. Decoder output layer norm
         self.decoder_output_ln = nn.LayerNorm(d_model)
         
-        # 13. Deep output head with skip connection and bottleneck
+        # 12. Deep output head with skip connection and bottleneck
         self.entity_head = nn.Sequential(
             nn.Linear(d_model, d_model * 2),
             nn.GELU(),
@@ -622,14 +626,14 @@ class SequencePredictor(nn.Module):
         # Skip connection gate for output head
         self.output_gate = nn.Parameter(torch.tensor(0.5))
         
-        # 14. Contrastive projection head (for auxiliary loss)
+        # 13. Contrastive projection head (for auxiliary loss)
         self.contrastive_proj = nn.Sequential(
             nn.Linear(d_model, d_model),
             nn.GELU(),
             nn.Linear(d_model, d_model // 2)
         )
         
-        # 15. Cache for causal mask
+        # 14. Cache for causal mask
         self._causal_mask_cache = {}
         
         # Initialize weights
@@ -637,9 +641,8 @@ class SequencePredictor(nn.Module):
     
     def _init_weights(self):
         """Initialize weights with scaled initialization for deep networks."""
-        # Scale based on number of layers for deep networks
-        total_layers = len(self.encoder_layers) + len(self.decoder_layers)
-        layer_scale = (2 * total_layers) ** -0.5
+        # Scale based on number of decoder layers
+        layer_scale = (2 * self.num_decoder_layers) ** -0.5
         
         # Entity embeddings
         nn.init.normal_(self.entity_embed.weight, mean=0.0, std=0.02)
@@ -674,27 +677,27 @@ class SequencePredictor(nn.Module):
         return self._causal_mask_cache[cache_key]
     
     def get_moe_aux_loss(self) -> torch.Tensor:
-        """Get combined auxiliary loss from all MoE layers (encoder + decoder)."""
+        """Get combined auxiliary loss from all MoE layers in the decoder."""
         if not self.use_moe:
             return torch.tensor(0.0)
         
         total_loss = torch.tensor(0.0, device=next(self.parameters()).device)
-        # Encoder MoE losses
-        for moe in self.encoder_moe_layers:
-            if moe is not None:
-                total_loss = total_loss + moe.get_aux_loss()
-        # Decoder MoE losses
+        # Decoder MoE losses only (no encoder MoE since we removed the useless encoder layers)
         for moe in self.decoder_moe_layers:
             if moe is not None:
                 total_loss = total_loss + moe.get_aux_loss()
         return total_loss
     
-    def encode(self,
-               player_civ: torch.Tensor,
-               enemy_civ: torch.Tensor,
-               map_id: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def compute_condition_memory(self,
+                                   player_civ: torch.Tensor,
+                                   enemy_civ: torch.Tensor,
+                                   map_id: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
-        Encode conditions (player civ, enemy civ, map) into memory for decoder cross-attention.
+        Project conditions (player civ, enemy civ, map) into memory for decoder cross-attention.
+        
+        NOTE: This is NOT an encoder! Self-attention on a single token is a no-op.
+        We simply project the concatenated condition embeddings through an MLP.
+        The decoder cross-attends to this condition memory at every layer.
         
         Args:
             player_civ: (B,) player civilization IDs
@@ -702,61 +705,49 @@ class SequencePredictor(nn.Module):
             map_id: (B,) map IDs
             
         Returns:
-            memory: (B, 1, d_model) encoded condition memory
-            map_emb: (B, 1, d_model) separate map embedding for decoder cross-attention
+            condition_memory: (B, 1, d_model) projected condition memory for cross-attention
+            map_emb: (B, 1, d_model) separate map embedding for per-layer map cross-attention
         """
         # Create condition embeddings
         p_civ = self.player_civ_embed(player_civ)   # (B, d_model)
         e_civ = self.enemy_civ_embed(enemy_civ)     # (B, d_model)
         map_emb = self.map_embed(map_id)            # (B, d_model)
         
-        # Combine conditions via projection
+        # Combine conditions via MLP projection (NOT a transformer encoder!)
         condition_concat = torch.cat([p_civ, e_civ, map_emb], dim=-1)  # (B, 3*d_model)
         condition = self.condition_proj(condition_concat)  # (B, d_model)
         
-        # Ensure we have a sequence dimension
+        # Ensure we have a sequence dimension for cross-attention
         if condition.dim() == 2:
             condition = condition.unsqueeze(1)  # (B, 1, d_model)
         
-        # Pass through encoder layers (no causal mask needed for conditions)
-        x = self.embed_ln(condition)
-        x = self.embed_dropout(x)
-        
-        for i, layer in enumerate(self.encoder_layers):
-            # Encoder layers only use self-attention (no causal mask for condition tokens)
-            x = layer(x, attn_mask=None, key_padding_mask=None)
-            
-            # Apply MoE if available for this layer
-            if self.use_moe and self.encoder_moe_layers[i] is not None:
-                x = self.encoder_moe_layers[i](x)
-        
-        # Apply encoder output layer norm
-        memory = self.encoder_output_ln(x)  # (B, 1, d_model)
+        # Apply layer norm to the projected condition
+        condition_memory = self.condition_output_ln(condition)  # (B, 1, d_model)
         
         # Prepare map embedding for decoder (ensure it has sequence dimension)
         if map_emb.dim() == 2:
             map_emb = map_emb.unsqueeze(1)  # (B, 1, d_model)
         
-        return memory, map_emb
+        return condition_memory, map_emb
     
     def forward(self,
                 entity_sequence: torch.Tensor,
                 player_civ: torch.Tensor,
                 enemy_civ: torch.Tensor,
                 map_id: torch.Tensor,
-                encoder_memory: Optional[torch.Tensor] = None,
+                condition_memory: Optional[torch.Tensor] = None,
                 attention_mask: Optional[torch.Tensor] = None,
                 predict_next: bool = True,
                 return_embeddings: bool = False) -> torch.Tensor:
         """
-        Forward pass with encoder-decoder architecture.
+        Forward pass with conditional decoder architecture.
         
         Args:
             entity_sequence: (B, L) entity token ids (padded) - decoder input
             player_civ: (B,) player civilization IDs
             enemy_civ: (B,) enemy civilization IDs
             map_id: (B,) map IDs
-            encoder_memory: (B, L_mem, d_model) optional pre-computed encoder output
+            condition_memory: (B, 1, d_model) optional pre-computed condition memory
             attention_mask: (B, L) boolean mask (1 for valid positions)
             predict_next: if True, predict next element; if False, predict all elements
             return_embeddings: if True, also return embeddings for contrastive loss
@@ -768,11 +759,11 @@ class SequencePredictor(nn.Module):
         batch_size, seq_len = entity_sequence.shape
         device = entity_sequence.device
         
-        # 1. Encode conditions if not provided
-        if encoder_memory is None:
-            encoder_memory, map_emb_memory = self.encode(player_civ, enemy_civ, map_id)  # (B, 1, d_model) each
+        # 1. Compute condition memory if not provided
+        if condition_memory is None:
+            condition_memory, map_emb_memory = self.compute_condition_memory(player_civ, enemy_civ, map_id)
         else:
-            # If encoder_memory is pre-computed, we still need map embedding for decoder
+            # If condition_memory is pre-computed, we still need map embedding for decoder
             map_emb_memory = self.map_embed(map_id)  # (B, d_model)
             if map_emb_memory.dim() == 2:
                 map_emb_memory = map_emb_memory.unsqueeze(1)  # (B, 1, d_model)
@@ -793,7 +784,7 @@ class SequencePredictor(nn.Module):
             entity_emb = entity_emb + pos_emb.unsqueeze(0)
         
         # 5. Apply gated cross-attention for initial condition fusion (before decoder)
-        entity_emb = self.condition_cross_attn(entity_emb, encoder_memory)
+        entity_emb = self.condition_cross_attn(entity_emb, condition_memory)
         
         # 6. Apply layer norm and dropout
         x = self.embed_ln(entity_emb)
@@ -806,26 +797,27 @@ class SequencePredictor(nn.Module):
             attention_mask = (entity_sequence != 0)
         tgt_key_padding_mask = ~attention_mask
         
-        # 8. Apply DECODER layers with cross-attention to encoder memory
-        # Note: map_emb_memory is already prepared from encode() or above
+        # 8. Apply DECODER layers with cross-attention to condition memory
         for i, layer in enumerate(self.decoder_layers):
             x = layer(
                 x, 
-                memory=encoder_memory,
+                memory=condition_memory,
                 tgt_mask=causal_mask, 
                 tgt_key_padding_mask=tgt_key_padding_mask,
-                memory_key_padding_mask=None  # Encoder memory has no padding
+                memory_key_padding_mask=None  # Condition memory has no padding
             )
             
             # Apply MoE if available for this layer
             if self.use_moe and self.decoder_moe_layers[i] is not None:
                 x = self.decoder_moe_layers[i](x)
             
-            # FIX: Apply map-specific cross-attention at each layer
+            # Apply map-specific cross-attention at each layer
             # This ensures map information influences generation at every step
+            # GatedCrossAttention already contains a residual (returns norm(x + gate*attn_out)),
+            # so we INTERPOLATE instead of adding, to avoid double-residual magnitude inflation.
             map_context = self.map_cross_attn_layers[i](x, map_emb_memory)
-            # Use learnable gate to control map influence
-            x = x + map_context * self.map_influence_gate
+            gate = torch.sigmoid(self.map_influence_gate)  # ensure [0, 1]
+            x = x * (1 - gate) + map_context * gate
         
         # 9. Apply decoder output layer norm
         decoded = self.decoder_output_ln(x)
@@ -1042,7 +1034,11 @@ class ContrastiveLoss(nn.Module):
         log_prob = F.log_softmax(similarity, dim=1)
         
         # Average log probability over positive pairs
-        loss = -(positive_mask * log_prob).sum() / positive_mask.sum().clamp(min=1)
+        # CRITICAL: Use masked_fill instead of multiplication to avoid 0 * -inf = NaN.
+        # log_prob has -inf on the diagonal (from similarity masking), and
+        # positive_mask has 0.0 on the diagonal, so 0.0 * -inf = NaN in IEEE 754.
+        masked_log_prob = log_prob.masked_fill(positive_mask == 0, 0.0)
+        loss = -masked_log_prob.sum() / positive_mask.sum().clamp(min=1)
         
         return loss
 
@@ -1144,16 +1140,17 @@ class SequencePredictorTrainer:
     def compute_loss(self,
                 entity_logits: torch.Tensor,
                 entity_targets: torch.Tensor,
-                player_civ: Optional[torch.Tensor] = None,
-                mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, float]]:
+                player_civ: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute loss for entity sequence prediction with masked label smoothing or Focal Loss.
         
+        NOTE: Padded positions in entity_targets should already be set to -100 (ignore_index)
+        by the caller before invoking this function. This function does NOT handle padding masks.
+        
         Args:
             entity_logits: (B, vocab_size_entity) or (B, L, vocab_size_entity)
-            entity_targets: (B,) or (B, L) entity targets
+            entity_targets: (B,) or (B, L) entity targets. Padded positions must be -100.
             player_civ: (B,) player civilization IDs for civ-entity masking
-            mask: optional mask for valid positions
             
         Returns:
             loss, loss_dict
@@ -1167,12 +1164,28 @@ class SequencePredictorTrainer:
             if entity_logits.dim() == 3:  # (B, L, vocab_size) - teacher forcing
                 # Expand mask for sequence dimension
                 B, L, V = entity_logits.shape
-                batch_mask = batch_mask.unsqueeze(1).expand(B, L, V)
+                batch_mask = batch_mask.unsqueeze(1).expand(B, L, V).clone()
+            else:
+                batch_mask = batch_mask.clone()
+            
+            # CRITICAL: Ensure target classes are NEVER masked out.
+            # If a target entity gets masked to -inf, the loss becomes inf/NaN.
+            # Only unmask for valid targets (not ignore_index=-100).
+            valid_targets = entity_targets != -100
+            if entity_logits.dim() == 3:
+                # (B, L, V) - scatter unmask at target positions
+                safe_targets = entity_targets.clone()
+                safe_targets[~valid_targets] = 0  # safe index for scatter
+                batch_mask.scatter_(-1, safe_targets.unsqueeze(-1), True)
+            else:
+                # (B, V) - unmask target entity for each sample
+                safe_targets = entity_targets.clone()
+                safe_targets[~valid_targets] = 0
+                batch_mask[torch.arange(batch_mask.size(0), device=batch_mask.device), safe_targets] = True
         
-        # Mask logits with -inf (standard masking)
-        # We rely on custom loss to handle -inf correctly via proper target masking
+        # Mask logits with large negative value (NOT -inf to prevent NaN in softmax/log_softmax)
         if batch_mask is not None:
-            entity_logits = entity_logits.masked_fill(~batch_mask, float('-inf'))
+            entity_logits = entity_logits.masked_fill(~batch_mask, -1e4)
             
         # Get class weights
         weights = self.entity_class_weights
@@ -1190,6 +1203,13 @@ class SequencePredictorTrainer:
         elif self.label_smoothing > 0:
             # Compute log probabilities
             log_probs = F.log_softmax(entity_logits, dim=-1)
+            
+            # Create a mask for valid targets (not ignore_index)
+            valid_target_mask = entity_targets != -100
+            
+            # Replace ignore_index with 0 for safe indexing (will be masked out)
+            safe_entity_targets = entity_targets.clone()
+            safe_entity_targets[~valid_target_mask] = 0
             
             # Construct smoothed targets
             with torch.no_grad():
@@ -1213,16 +1233,23 @@ class SequencePredictorTrainer:
                 # This formulation assumes: target dist = (1-eps)*one_hot + eps*uniform_over_valid
                 # Sum of prob = (1-eps) + eps = 1.0 (Correct)
                 
-                # Gather targets
+                # Gather targets (use safe targets to avoid negative index crash)
                 if entity_logits.dim() == 2:
-                    current_targets = entity_targets.unsqueeze(-1)
+                    current_targets = safe_entity_targets.unsqueeze(-1)
                 else:
                     # Flatten for easier handling or keep 3D
-                    current_targets = entity_targets.unsqueeze(-1)
+                    current_targets = safe_entity_targets.unsqueeze(-1)
                 
                 # Scatter add
                 src = torch.full_like(current_targets, 1.0 - epsilon, dtype=true_dist.dtype)
                 true_dist.scatter_add_(-1, current_targets, src)
+                
+                # Zero out distribution for ignored positions
+                if entity_logits.dim() == 3:
+                    # (B, L) -> (B, L, 1) to broadcast over vocab dim
+                    true_dist = true_dist * valid_target_mask.unsqueeze(-1).float()
+                else:
+                    true_dist = true_dist * valid_target_mask.unsqueeze(-1).float()
             
             # Compute cross entropy: - sum(target * log_prob)
             # Handle -inf in log_probs by masking the product
@@ -1242,18 +1269,20 @@ class SequencePredictorTrainer:
             if weights is not None:
                 # Flatten weights if needed
                 weights = weights.to(loss_per_sample.device)
-                sample_weights = weights[entity_targets]
+                sample_weights = weights[safe_entity_targets]
                 loss_per_sample = loss_per_sample * sample_weights
-                
-            entity_loss = loss_per_sample.mean()
+            
+            # Average only over valid (non-padded) positions
+            valid_count_total = valid_target_mask.float().sum().clamp(min=1.0)
+            entity_loss = (loss_per_sample * valid_target_mask.float()).sum() / valid_count_total
             
         else:
-            # Standard Cross Entropy
+            # Standard Cross Entropy (with ignore_index for padded positions)
             if entity_logits.dim() == 2:
-                entity_loss = F.cross_entropy(entity_logits, entity_targets, weight=weights)
+                entity_loss = F.cross_entropy(entity_logits, entity_targets, weight=weights, ignore_index=-100)
             else:
                 # (B, L, V) -> (B, V, L) for cross_entropy
-                entity_loss = F.cross_entropy(entity_logits.transpose(1, 2), entity_targets, weight=weights)
+                entity_loss = F.cross_entropy(entity_logits.transpose(1, 2), entity_targets, weight=weights, ignore_index=-100)
         
         loss_dict = {
             'loss': entity_loss.item(),
@@ -1289,66 +1318,28 @@ class SequencePredictorTrainer:
         if self.use_augmentation and self.model.training and random.random() < self.augment_prob:
             entity_ids, mask = self.augmenter.augment(entity_ids, mask)
         
-        # Track losses
-        total_loss = torch.tensor(0.0, device=self.device)
         loss_dict = {}
         
-        # Prepare targets (shifted by one for next element prediction)
-        if teacher_forcing_ratio > 0 and torch.rand(1).item() < teacher_forcing_ratio:
-            # Teacher forcing: predict all next elements
+        # Determine teacher forcing mode
+        use_tf = teacher_forcing_ratio > 0 and torch.rand(1).item() < teacher_forcing_ratio
+        
+        if use_tf:
+            # Teacher forcing: predict all next elements shifted by 1
             entity_targets = entity_ids[:, 1:].contiguous()
             entity_input = entity_ids[:, :-1].contiguous()
+            input_mask = mask[:, :-1].contiguous() if mask is not None else None
             
+            # CRITICAL FIX: Mark padded target positions as ignore_index (-100)
+            # so they don't contribute to the loss. Without this, the model
+            # trains against PAD tokens (id=0) at padded positions -> garbage gradients.
             if mask is not None:
-                input_mask = mask[:, :-1].contiguous()
-            else:
-                input_mask = None
+                target_mask = mask[:, 1:].contiguous()  # shifted mask for targets
+                entity_targets = entity_targets.clone()
+                entity_targets[~target_mask] = -100
             
-            # Forward pass with optional contrastive embeddings
-            if self.scaler is not None:
-                with torch.amp.autocast(device_type='cuda', enabled=True):
-                    if self.use_contrastive:
-                        entity_logits, contrastive_emb = self.model(
-                            entity_sequence=entity_input, 
-                            player_civ=player_civ, 
-                            enemy_civ=enemy_civ, 
-                            map_id=map_id, 
-                            attention_mask=input_mask, 
-                            predict_next=False, 
-                            return_embeddings=True
-                        )
-                    else:
-                        entity_logits = self.model(
-                            entity_sequence=entity_input, 
-                            player_civ=player_civ, 
-                            enemy_civ=enemy_civ, 
-                            map_id=map_id, 
-                            attention_mask=input_mask, 
-                            predict_next=False
-                        )
-            else:
-                if self.use_contrastive:
-                    entity_logits, contrastive_emb = self.model(
-                        entity_sequence=entity_input, 
-                        player_civ=player_civ, 
-                        enemy_civ=enemy_civ, 
-                        map_id=map_id, 
-                        attention_mask=input_mask, 
-                        predict_next=False, 
-                        return_embeddings=True
-                    )
-                else:
-                    entity_logits = self.model(
-                        entity_sequence=entity_input, 
-                        player_civ=player_civ, 
-                        enemy_civ=enemy_civ, 
-                        map_id=map_id, 
-                        attention_mask=input_mask, 
-                        predict_next=False
-                    )
-                
+            predict_next = False
         else:
-            # Standard next element prediction
+            # Standard next element prediction (single token)
             if mask is not None:
                 seq_lengths = mask.sum(dim=1).long() - 1
                 max_valid_idx = entity_ids.size(1) - 2
@@ -1359,77 +1350,67 @@ class SequencePredictorTrainer:
                 entity_input = entity_ids[:, :max_length].contiguous()
                 entity_targets = entity_ids[batch_indices, seq_lengths + 1].contiguous()
                 
-                batch_size, max_len = entity_input.shape
-                input_mask = (torch.arange(max_len, device=self.device).unsqueeze(0).expand(batch_size, -1) 
+                batch_size_local, max_len = entity_input.shape
+                input_mask = (torch.arange(max_len, device=self.device).unsqueeze(0).expand(batch_size_local, -1) 
                               < seq_lengths.unsqueeze(1))
             else:
                 entity_input = entity_ids[:, :-1].contiguous()
                 entity_targets = entity_ids[:, -1].contiguous()
                 input_mask = None
             
-            # Forward pass
-            if self.scaler is not None:
-                with torch.amp.autocast(device_type='cuda', enabled=True):
-                    if self.use_contrastive:
-                        entity_logits, contrastive_emb = self.model(
-                            entity_sequence=entity_input, 
-                            player_civ=player_civ, 
-                            enemy_civ=enemy_civ, 
-                            map_id=map_id, 
-                            attention_mask=input_mask, 
-                            predict_next=True, 
-                            return_embeddings=True
-                        )
-                    else:
-                        entity_logits = self.model(
-                            entity_sequence=entity_input, 
-                            player_civ=player_civ, 
-                            enemy_civ=enemy_civ, 
-                            map_id=map_id, 
-                            attention_mask=input_mask, 
-                            predict_next=True
-                        )
+            predict_next = True
+        
+        # FIX: Single autocast block wrapping BOTH forward pass AND loss computation.
+        # Previously only the forward pass was inside autocast, leaving loss computation
+        # to operate on fp16 logits with -inf values outside autocast -> NaN.
+        contrastive_emb = None
+        with torch.amp.autocast(device_type='cuda', enabled=self.use_amp):
+            if self.use_contrastive:
+                entity_logits, contrastive_emb = self.model(
+                    entity_sequence=entity_input, 
+                    player_civ=player_civ, 
+                    enemy_civ=enemy_civ, 
+                    map_id=map_id, 
+                    attention_mask=input_mask, 
+                    predict_next=predict_next, 
+                    return_embeddings=True
+                )
             else:
-                if self.use_contrastive:
-                    entity_logits, contrastive_emb = self.model(
-                        entity_sequence=entity_input, 
-                        player_civ=player_civ, 
-                        enemy_civ=enemy_civ, 
-                        map_id=map_id, 
-                        attention_mask=input_mask, 
-                        predict_next=True, 
-                        return_embeddings=True
-                    )
-                else:
-                    entity_logits = self.model(
-                        entity_sequence=entity_input, 
-                        player_civ=player_civ, 
-                        enemy_civ=enemy_civ, 
-                        map_id=map_id, 
-                        attention_mask=input_mask, 
-                        predict_next=True
-                    )
+                entity_logits = self.model(
+                    entity_sequence=entity_input, 
+                    player_civ=player_civ, 
+                    enemy_civ=enemy_civ, 
+                    map_id=map_id, 
+                    attention_mask=input_mask, 
+                    predict_next=predict_next
+                )
+            
+            # Compute main prediction loss (inside autocast for numerical stability)
+            main_loss, main_loss_dict = self.compute_loss(
+                entity_logits, entity_targets, player_civ
+            )
+            
+            total_loss = main_loss
+            loss_dict['main_loss'] = main_loss.item()
+            
+            # Add contrastive loss if enabled
+            if self.use_contrastive and contrastive_emb is not None:
+                contrastive_loss_val = self.contrastive_loss(contrastive_emb, player_civ)
+                total_loss = total_loss + self.contrastive_weight * contrastive_loss_val
+                loss_dict['contrastive_loss'] = contrastive_loss_val.item()
+            
+            # Add MoE auxiliary loss if model has it
+            if hasattr(self.model, 'get_moe_aux_loss'):
+                moe_loss = self.model.get_moe_aux_loss()
+                if moe_loss.item() > 0:
+                    total_loss = total_loss + moe_loss
+                    loss_dict['moe_aux_loss'] = moe_loss.item()
         
-        # Compute main prediction loss
-        main_loss, main_loss_dict = self.compute_loss(
-            entity_logits, entity_targets, player_civ, mask
-        )
-        total_loss = total_loss + main_loss
-        loss_dict['main_loss'] = main_loss.item()
-        
-        # Add contrastive loss if enabled
-        if self.use_contrastive and 'contrastive_emb' in locals():
-            # Use player_civ as labels (sequences from same civ should be similar)
-            contrastive_loss_val = self.contrastive_loss(contrastive_emb, player_civ)
-            total_loss = total_loss + self.contrastive_weight * contrastive_loss_val
-            loss_dict['contrastive_loss'] = contrastive_loss_val.item()
-        
-        # Add MoE auxiliary loss if model has it
-        if hasattr(self.model, 'get_moe_aux_loss'):
-            moe_loss = self.model.get_moe_aux_loss()
-            if moe_loss.item() > 0:
-                total_loss = total_loss + moe_loss
-                loss_dict['moe_aux_loss'] = moe_loss.item()
+        # Check for NaN/Inf loss before backward pass
+        if not torch.isfinite(total_loss):
+            print(f"WARNING: Non-finite loss detected ({total_loss.item():.4f}), skipping backward pass")
+            loss_dict['loss'] = float('nan')
+            return loss_dict
         
         loss_dict['loss'] = total_loss.item()
         
@@ -1493,9 +1474,18 @@ class SequencePredictorTrainer:
                 if mask is not None:
                     mask = mask.to(self.device)
                 
-                # Use all but last element as input, last element as target
+                # Compute targets correctly: use the token AFTER the last valid position
+                # (not entity_ids[:, -1] which is PAD for padded sequences)
+                if mask is not None:
+                    seq_lengths = mask.sum(dim=1).long() - 1
+                    max_valid_idx = entity_ids.size(1) - 2
+                    seq_lengths = torch.clamp(seq_lengths, min=0, max=max_valid_idx)
+                    batch_indices = torch.arange(entity_ids.size(0), device=self.device)
+                    entity_targets = entity_ids[batch_indices, seq_lengths + 1].contiguous()
+                else:
+                    entity_targets = entity_ids[:, -1].contiguous()
+                
                 entity_input = entity_ids[:, :-1].contiguous()
-                entity_targets = entity_ids[:, -1].contiguous()
                 
                 if mask is not None:
                     input_mask = mask[:, :-1].contiguous()
@@ -1795,8 +1785,6 @@ def main():
                        help='Model dimension')
     parser.add_argument('--nhead', type=int, default=16,
                        help='Number of attention heads')
-    parser.add_argument('--num_encoder_layers', type=int, default=6,
-                       help='Number of encoder transformer layers')
     parser.add_argument('--num_decoder_layers', type=int, default=8,
                        help='Number of decoder transformer layers')
     parser.add_argument('--dim_feedforward', type=int, default=2048,
@@ -1889,15 +1877,16 @@ def main():
         wins_only=args.wins_only
     )
     
-    # Create model with encoder-decoder architecture
-    print("Initializing encoder-decoder model...")
+    # Create model with conditional decoder architecture
+    # NOTE: This is NOT an encoder-decoder. The condition projection is just an MLP.
+    # Self-attention on a single token (the condition vector) is useless, so we removed it.
+    print("Initializing conditional decoder model...")
     model = SequencePredictor(
         vocab_size_entity=len(entity_vocab),
         civ_vocab_size=len(civ_vocab),
         map_vocab_size=len(map_vocab),
         d_model=args.d_model,
         nhead=args.nhead,
-        num_encoder_layers=args.num_encoder_layers,
         num_decoder_layers=args.num_decoder_layers,
         dim_feedforward=args.dim_feedforward,
         dropout=args.dropout,
@@ -1977,14 +1966,13 @@ def main():
     if not args.no_wandb:
         wb_cfg = {
             'learning_rate': args.lr,
-            'architecture': 'EncoderDecoderSequencePredictor',
+            'architecture': 'ConditionalDecoder',  # NOT encoder-decoder! Just MLP projection + decoder
             'dataset': os.path.basename(args.csv_path),
             'epochs': args.epochs,
             'batch_size': args.batch_size,
             'effective_batch_size': args.batch_size * args.grad_accum_steps,
             'd_model': args.d_model,
             'nhead': args.nhead,
-            'num_encoder_layers': args.num_encoder_layers,
             'num_decoder_layers': args.num_decoder_layers,
             'dim_feedforward': args.dim_feedforward,
             'max_seq_len': args.max_seq_len,
@@ -2039,6 +2027,8 @@ def main():
         # Training phase
         model.train()
         train_losses = []
+        epoch_grad_norm = 0.0
+        grad_norm_count = 0
         
         for batch_idx, batch in enumerate(train_loader):
             # Training step
@@ -2047,20 +2037,44 @@ def main():
                 teacher_forcing_ratio=args.teacher_forcing_ratio
             )
             
-            train_losses.append(loss_dict['loss'])
+            # Only track finite losses (skip NaN from skipped batches)
+            if math.isfinite(loss_dict['loss']):
+                train_losses.append(loss_dict['loss'])
             
-            # Step scheduler after each optimizer step
+            # Step scheduler and compute grad norm after each optimizer step
             if (batch_idx + 1) % args.grad_accum_steps == 0:
+                # Compute gradient norm BEFORE optimizer.zero_grad() clears them
+                # (This is done inside train_step now, but we capture it here
+                # for logging since train_step has already stepped the optimizer)
+                # We compute it from the model params that still have grad from
+                # the last backward pass before optimizer stepped
+                current_grad_norm = 0.0
+                for p in model.parameters():
+                    if p.grad is not None:
+                        current_grad_norm += p.grad.data.norm(2).item() ** 2
+                current_grad_norm = current_grad_norm ** 0.5
+                epoch_grad_norm += current_grad_norm
+                grad_norm_count += 1
+                
                 scheduler.step()
                 global_step += 1
             
-            # Log step-level training loss to W&B
-            if not args.no_wandb:
-                wandb.log({
+            # Log step-level training loss to W&B (only finite values)
+            if not args.no_wandb and math.isfinite(loss_dict.get('loss', float('nan'))):
+                step_log = {
                     'step': global_step,
                     'train_step/loss': loss_dict['loss'],
                     'train_step/lr': optimizer.param_groups[0]['lr'],
-                }, step=global_step)
+                }
+                if 'main_loss' in loss_dict and math.isfinite(loss_dict['main_loss']):
+                    step_log['train_step/main_loss'] = loss_dict['main_loss']
+                if 'contrastive_loss' in loss_dict and math.isfinite(loss_dict['contrastive_loss']):
+                    step_log['train_step/contrastive_loss'] = loss_dict['contrastive_loss']
+                if 'moe_aux_loss' in loss_dict and math.isfinite(loss_dict['moe_aux_loss']):
+                    step_log['train_step/moe_aux_loss'] = loss_dict['moe_aux_loss']
+                if grad_norm_count > 0:
+                    step_log['train_step/grad_norm'] = current_grad_norm
+                wandb.log(step_log, step=global_step)
             
             # Log batch progress
             if (batch_idx + 1) % 50 == 0:
@@ -2068,8 +2082,12 @@ def main():
                 print(f"  Batch {batch_idx + 1}/{len(train_loader)}, "
                       f"Loss: {loss_dict['loss']:.4f}, LR: {current_lr:.6f}")
         
-        # Calculate training metrics
-        avg_train_loss = np.mean(train_losses)
+        # Calculate training metrics (only from finite losses)
+        if train_losses:
+            avg_train_loss = np.mean(train_losses)
+        else:
+            avg_train_loss = float('nan')
+            print("  WARNING: All training losses were NaN this epoch!")
         
         print(f"\nTraining Results:")
         print(f"  Average Loss: {avg_train_loss:.4f}")
@@ -2127,12 +2145,8 @@ def main():
         
         # Log to Weights & Biases
         if not args.no_wandb:
-            # Calculate gradient norm for monitoring
-            total_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    total_norm += p.grad.data.norm(2).item() ** 2
-            total_norm = total_norm ** 0.5
+            # Use average gradient norm computed DURING training (not after eval)
+            avg_grad_norm = epoch_grad_norm / max(grad_norm_count, 1)
             
             wandb.log({
                 'epoch': epoch + 1,
@@ -2147,7 +2161,7 @@ def main():
                 'val/mean_per_class_accuracy': val_metrics['mean_per_class_accuracy'],
                 # Training dynamics
                 'training/learning_rate': current_lr,
-                'training/grad_norm': total_norm,
+                'training/grad_norm': avg_grad_norm,
                 'training/patience_counter': patience_counter,
                 # Best metrics tracking
                 'best/val_loss': best_val_loss,
@@ -2191,7 +2205,7 @@ def main():
         'args': vars(args),
         'val_metrics': final_metrics,
         'best_val_loss': best_val_loss,
-        'architecture': 'EnhancedSequencePredictor'
+        'architecture': 'ConditionalDecoder'  # NOT encoder-decoder! Just MLP condition projection + decoder
     }
     torch.save(final_checkpoint, 'final_model.pth')
     
