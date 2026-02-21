@@ -22,10 +22,10 @@ Usage:
   Last run parameters:
 python BuildOrderPrediction/MoE_WithDecoder_train.py \
   --wins_only --max_seq_len 50 --csv_path training_data_2026_01.csv \
-  --d_model 768 --nhead 12 --num_decoder_layers 10 --dim_feedforward 3072 \
-  --batch_size 64 --grad_accum_steps 4 --dropout 0.1 \
+  --d_model 1024 --nhead 16 --num_decoder_layers 12 --dim_feedforward 4096 \
+  --batch_size 80 --grad_accum_steps 3 --dropout 0.1 \
   --num_experts 8 --use_moe --use_ngram --use_rope --use_contrastive \
-  --teacher_forcing_ratio 1.0 --epochs 70
+  --epochs 70 --pos_weight_max 5.0 --late_focus_prob 0.4
   """
 
 class FocalLoss(nn.Module):
@@ -1088,7 +1088,9 @@ class SequencePredictorTrainer:
                  use_contrastive: bool = True,
                  contrastive_weight: float = 0.1,
                  use_augmentation: bool = True,
-                 augment_prob: float = 0.3):
+                 augment_prob: float = 0.3,
+                 pos_weight_max: float = 3.0,
+                 late_focus_prob: float = 0.4):
         self.model = model
         self.optimizer = optimizer
         self.device = device
@@ -1111,8 +1113,8 @@ class SequencePredictorTrainer:
             self.criterion = FocalLoss(
                 alpha=self.entity_class_weights,
                 gamma=self.focal_loss_gamma,
-                reduction='mean',
-                ignore_index=-100 # Standard ignore index
+                reduction='none',
+                ignore_index=-100
             )
         
         # Contrastive learning
@@ -1136,11 +1138,14 @@ class SequencePredictorTrainer:
             
         self.grad_accum_steps = grad_accum_steps
         self._accum_step = 0
+        self.pos_weight_max = pos_weight_max
+        self.late_focus_prob = late_focus_prob
         
     def compute_loss(self,
                 entity_logits: torch.Tensor,
                 entity_targets: torch.Tensor,
-                player_civ: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, float]]:
+                player_civ: Optional[torch.Tensor] = None,
+                pos_weights: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute loss for entity sequence prediction with masked label smoothing or Focal Loss.
         
@@ -1192,13 +1197,22 @@ class SequencePredictorTrainer:
         
         # Custom Loss Calculation
         if self.use_focal_loss:
-            # Use Focal Loss
-            # Focal Loss expects same shape as cross_entropy input
+            # FocalLoss returns per-element losses (reduction='none'), shape (B*L,) or (B,)
+            focal_per_elem = self.criterion(entity_logits, entity_targets)
+
             if entity_logits.dim() == 3:
-                 # (B, L, V) -> (B, V, L) if using cross_entropy usually, but our FocalLoss handles (B, C, L) check
-                 pass # Our focal loss handles dimensions
-            
-            entity_loss = self.criterion(entity_logits, entity_targets)
+                B, L, _ = entity_logits.shape
+                focal_per_pos = focal_per_elem.reshape(B, L)          # (B, L)
+                valid_mask_f = (entity_targets != -100).float()        # (B, L)
+                if pos_weights is not None:
+                    effective_weights = valid_mask_f * pos_weights
+                else:
+                    effective_weights = valid_mask_f
+                entity_loss = (focal_per_pos * effective_weights).sum() / effective_weights.sum().clamp(min=1.0)
+            else:
+                # 1-D case: no positional weighting possible, just mean over valid
+                valid_mask_f = (entity_targets != -100).float()
+                entity_loss = focal_per_elem.sum() / valid_mask_f.sum().clamp(min=1.0)
             
         elif self.label_smoothing > 0:
             # Compute log probabilities
@@ -1272,17 +1286,31 @@ class SequencePredictorTrainer:
                 sample_weights = weights[safe_entity_targets]
                 loss_per_sample = loss_per_sample * sample_weights
             
-            # Average only over valid (non-padded) positions
-            valid_count_total = valid_target_mask.float().sum().clamp(min=1.0)
-            entity_loss = (loss_per_sample * valid_target_mask.float()).sum() / valid_count_total
+            # Average only over valid (non-padded) positions, optionally weighted by position
+            valid_mask_f = valid_target_mask.float()
+            if pos_weights is not None:
+                effective_weights = valid_mask_f * pos_weights
+            else:
+                effective_weights = valid_mask_f
+            weight_sum = effective_weights.sum().clamp(min=1.0)
+            entity_loss = (loss_per_sample * effective_weights).sum() / weight_sum
             
         else:
             # Standard Cross Entropy (with ignore_index for padded positions)
-            if entity_logits.dim() == 2:
-                entity_loss = F.cross_entropy(entity_logits, entity_targets, weight=weights, ignore_index=-100)
+            if entity_logits.dim() == 2 or pos_weights is None:
+                if entity_logits.dim() == 2:
+                    entity_loss = F.cross_entropy(entity_logits, entity_targets, weight=weights, ignore_index=-100)
+                else:
+                    entity_loss = F.cross_entropy(entity_logits.transpose(1, 2), entity_targets, weight=weights, ignore_index=-100)
             else:
-                # (B, L, V) -> (B, V, L) for cross_entropy
-                entity_loss = F.cross_entropy(entity_logits.transpose(1, 2), entity_targets, weight=weights, ignore_index=-100)
+                # (B, L, V) with positional weighting — need per-position losses
+                loss_per_pos = F.cross_entropy(
+                    entity_logits.transpose(1, 2), entity_targets,
+                    weight=weights, ignore_index=-100, reduction='none'
+                )  # (B, L)
+                valid_mask_f = (entity_targets != -100).float()
+                effective_weights = valid_mask_f * pos_weights
+                entity_loss = (loss_per_pos * effective_weights).sum() / effective_weights.sum().clamp(min=1.0)
         
         loss_dict = {
             'loss': entity_loss.item(),
@@ -1291,20 +1319,19 @@ class SequencePredictorTrainer:
         return entity_loss, loss_dict
     
     def train_step(self,
-              batch: Dict[str, torch.Tensor],
-              teacher_forcing_ratio: float = 0.5) -> Dict[str, float]:
+              batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
         """
         Single training step with augmentation and contrastive learning.
-        
+        Trains on every token in the sequence (standard LM training).
+
         Args:
             batch: dictionary with 'entity_ids' and optionally 'mask'
-            teacher_forcing_ratio: probability of using teacher forcing
-            
+
         Returns:
             loss_dict
         """
         self.model.train()
-        
+
         # Move batch to device
         entity_ids = batch['entity_ids'].to(self.device)
         player_civ = batch['player_civ'].to(self.device)
@@ -1313,81 +1340,63 @@ class SequencePredictorTrainer:
         mask = batch.get('mask', None)
         if mask is not None:
             mask = mask.to(self.device)
-        
+
         # Apply augmentation with some probability
         if self.use_augmentation and self.model.training and random.random() < self.augment_prob:
             entity_ids, mask = self.augmenter.augment(entity_ids, mask)
-        
+
         loss_dict = {}
-        
-        # Determine teacher forcing mode
-        use_tf = teacher_forcing_ratio > 0 and torch.rand(1).item() < teacher_forcing_ratio
-        
-        if use_tf:
-            # Teacher forcing: predict all next elements shifted by 1
-            entity_targets = entity_ids[:, 1:].contiguous()
-            entity_input = entity_ids[:, :-1].contiguous()
-            input_mask = mask[:, :-1].contiguous() if mask is not None else None
-            
-            # CRITICAL FIX: Mark padded target positions as ignore_index (-100)
-            # so they don't contribute to the loss. Without this, the model
-            # trains against PAD tokens (id=0) at padded positions -> garbage gradients.
-            if mask is not None:
-                target_mask = mask[:, 1:].contiguous()  # shifted mask for targets
-                entity_targets = entity_targets.clone()
-                entity_targets[~target_mask] = -100
-            
-            predict_next = False
-        else:
-            # Standard next element prediction (single token)
-            if mask is not None:
-                seq_lengths = mask.sum(dim=1).long() - 1
-                max_valid_idx = entity_ids.size(1) - 2
-                seq_lengths = torch.clamp(seq_lengths, min=0, max=max_valid_idx)
-                
-                batch_indices = torch.arange(entity_ids.size(0), device=self.device)
-                max_length = seq_lengths.max().item() + 1
-                entity_input = entity_ids[:, :max_length].contiguous()
-                entity_targets = entity_ids[batch_indices, seq_lengths + 1].contiguous()
-                
-                batch_size_local, max_len = entity_input.shape
-                input_mask = (torch.arange(max_len, device=self.device).unsqueeze(0).expand(batch_size_local, -1) 
-                              < seq_lengths.unsqueeze(1))
-            else:
-                entity_input = entity_ids[:, :-1].contiguous()
-                entity_targets = entity_ids[:, -1].contiguous()
-                input_mask = None
-            
-            predict_next = True
-        
-        # FIX: Single autocast block wrapping BOTH forward pass AND loss computation.
-        # Previously only the forward pass was inside autocast, leaving loss computation
-        # to operate on fp16 logits with -inf values outside autocast -> NaN.
+
+        # Always train on every token: input is sequence[:-1], target is sequence[1:]
+        entity_input = entity_ids[:, :-1].contiguous()   # (B, L)
+        entity_targets = entity_ids[:, 1:].contiguous()  # (B, L), shifted by 1
+        input_mask = mask[:, :-1].contiguous() if mask is not None else None
+
+        # Mark padded target positions as ignore_index so they don't contribute to loss
+        if mask is not None:
+            target_mask = mask[:, 1:].contiguous()
+            entity_targets = entity_targets.clone()
+            entity_targets[~target_mask] = -100
+
+        seq_len = entity_input.size(1)
+
+        # Late-focus pass: with late_focus_prob, zero out the first half of targets
+        # so the loss trains exclusively on the latter half of the sequence (Q3-Q5).
+        if torch.rand(1).item() < self.late_focus_prob:
+            late_start = seq_len // 2
+            entity_targets = entity_targets.clone()
+            entity_targets[:, :late_start] = -100
+
         contrastive_emb = None
         with torch.amp.autocast(device_type='cuda', enabled=self.use_amp):
             if self.use_contrastive:
                 entity_logits, contrastive_emb = self.model(
-                    entity_sequence=entity_input, 
-                    player_civ=player_civ, 
-                    enemy_civ=enemy_civ, 
-                    map_id=map_id, 
-                    attention_mask=input_mask, 
-                    predict_next=predict_next, 
+                    entity_sequence=entity_input,
+                    player_civ=player_civ,
+                    enemy_civ=enemy_civ,
+                    map_id=map_id,
+                    attention_mask=input_mask,
+                    predict_next=False,
                     return_embeddings=True
                 )
             else:
                 entity_logits = self.model(
-                    entity_sequence=entity_input, 
-                    player_civ=player_civ, 
-                    enemy_civ=enemy_civ, 
-                    map_id=map_id, 
-                    attention_mask=input_mask, 
-                    predict_next=predict_next
+                    entity_sequence=entity_input,
+                    player_civ=player_civ,
+                    enemy_civ=enemy_civ,
+                    map_id=map_id,
+                    attention_mask=input_mask,
+                    predict_next=False
                 )
-            
+
+            # Positional weights: linear ramp 1.0 → pos_weight_max
+            pos_indices = torch.arange(seq_len, dtype=torch.float32, device=self.device)
+            pos_weight_vec = 1.0 + (self.pos_weight_max - 1.0) * pos_indices / max(seq_len - 1, 1)
+            pos_weights = pos_weight_vec.unsqueeze(0).expand(entity_input.size(0), -1)  # (B, L)
+
             # Compute main prediction loss (inside autocast for numerical stability)
             main_loss, main_loss_dict = self.compute_loss(
-                entity_logits, entity_targets, player_civ
+                entity_logits, entity_targets, player_civ, pos_weights=pos_weights
             )
             
             total_loss = main_loss
@@ -1453,15 +1462,21 @@ class SequencePredictorTrainer:
         """
         self.model.eval()
         total_loss = 0.0
+        total_sequences = 0   # for loss averaging
         total_correct_entity = 0
         total_correct_top3 = 0
         total_correct_top5 = 0
         total_correct_top10 = 0
-        total_samples = 0
+        total_samples = 0     # total valid token positions, for accuracy averaging
         
         # Track per-category performance
         category_correct = {}
         category_total = {}
+
+        # Track accuracy for each fifth of the sequence
+        num_fifths = 5
+        fifth_correct = [0 for _ in range(num_fifths)]
+        fifth_total = [0 for _ in range(num_fifths)]
         
         with torch.no_grad():
             for batch in dataloader:
@@ -1492,55 +1507,81 @@ class SequencePredictorTrainer:
                 else:
                     input_mask = None
                 
-                # Forward pass
+                # Forward pass for loss only (predict_next=True)
                 entity_logits = self.model(
-                    entity_sequence=entity_input, 
-                    player_civ=player_civ, 
-                    enemy_civ=enemy_civ, 
-                    map_id=map_id, 
-                    attention_mask=input_mask, 
+                    entity_sequence=entity_input,
+                    player_civ=player_civ,
+                    enemy_civ=enemy_civ,
+                    map_id=map_id,
+                    attention_mask=input_mask,
                     predict_next=True
                 )
-                
-                # Compute loss (with civ-entity masking)
-                loss, _ = self.compute_loss(
-                    entity_logits,
-                    entity_targets,
-                    player_civ
-                )
-                
-                # Compute accuracy
-                entity_preds = torch.argmax(entity_logits, dim=-1)
-                correct = (entity_preds == entity_targets)
-                
-                # Compute Top-K Accuracy
-                _, top3_preds = entity_logits.topk(3, dim=-1)
-                _, top5_preds = entity_logits.topk(5, dim=-1)
-                _, top10_preds = entity_logits.topk(10, dim=-1)
-                
-                top3_correct = top3_preds.eq(entity_targets.view(-1, 1).expand_as(top3_preds))
-                top5_correct = top5_preds.eq(entity_targets.view(-1, 1).expand_as(top5_preds))
-                top10_correct = top10_preds.eq(entity_targets.view(-1, 1).expand_as(top10_preds))
-                
-                total_correct_top3 += top3_correct.any(dim=1).sum().item()
-                total_correct_top5 += top5_correct.any(dim=1).sum().item()
-                total_correct_top10 += top10_correct.any(dim=1).sum().item()
-                
-                # Track per-target category performance
-                for i, target in enumerate(entity_targets):
-                    target_id = target.item()
-                    if target_id not in category_total:
-                        category_total[target_id] = 0
-                        category_correct[target_id] = 0
-                    category_total[target_id] += 1
-                    if correct[i]:
-                        category_correct[target_id] += 1
-                
+                loss, _ = self.compute_loss(entity_logits, entity_targets, player_civ)
                 total_loss += loss.item() * entity_ids.size(0)
-                total_correct_entity += correct.sum().item()
-                total_samples += entity_ids.size(0)
+                total_sequences += entity_ids.size(0)
+
+                # Forward pass for all accuracy metrics (predict_next=False, teacher-forced)
+                # This gives predictions at every position so per-fifth and overall
+                # accuracy are computed with the same protocol and are directly comparable.
+                all_pos_logits = self.model(
+                    entity_sequence=entity_input,
+                    player_civ=player_civ,
+                    enemy_civ=enemy_civ,
+                    map_id=map_id,
+                    attention_mask=input_mask,
+                    predict_next=False
+                )  # (B, L, vocab_size)
+
+                seq_len = entity_input.size(1)
+                fifth_size = seq_len // num_fifths
+
+                # Targets at every position: entity_ids shifted by 1  (B, L)
+                pos_targets = entity_ids[:, 1:seq_len + 1]
+
+                # Valid positions: non-PAD, non-ignore targets, within the sequence mask
+                pos_valid = (pos_targets != 0) & (pos_targets != -100)
+                if mask is not None:
+                    valid_lens = mask.sum(dim=1).long() - 1  # exclude BOS
+                    for b in range(entity_input.size(0)):
+                        pos_valid[b, valid_lens[b]:] = False
+
+                all_pos_preds = torch.argmax(all_pos_logits, dim=-1)  # (B, L)
+                pos_correct = (all_pos_preds == pos_targets) & pos_valid  # (B, L)
+
+                # Overall accuracy (per token, consistent with per-fifth)
+                total_correct_entity += pos_correct.sum().item()
+                total_samples += pos_valid.sum().item()
+
+                # Top-K accuracy
+                _, top3_preds = all_pos_logits.topk(3, dim=-1)   # (B, L, 3)
+                _, top5_preds = all_pos_logits.topk(5, dim=-1)   # (B, L, 5)
+                _, top10_preds = all_pos_logits.topk(10, dim=-1) # (B, L, 10)
+                tgt_exp = pos_targets.unsqueeze(-1)  # (B, L, 1)
+                total_correct_top3  += (top3_preds.eq(tgt_exp).any(dim=-1)  & pos_valid).sum().item()
+                total_correct_top5  += (top5_preds.eq(tgt_exp).any(dim=-1)  & pos_valid).sum().item()
+                total_correct_top10 += (top10_preds.eq(tgt_exp).any(dim=-1) & pos_valid).sum().item()
+
+                # Per-category accuracy
+                for b in range(entity_input.size(0)):
+                    for pos in range(seq_len):
+                        if not pos_valid[b, pos]:
+                            continue
+                        target_id = pos_targets[b, pos].item()
+                        if target_id not in category_total:
+                            category_total[target_id] = 0
+                            category_correct[target_id] = 0
+                        category_total[target_id] += 1
+                        if pos_correct[b, pos]:
+                            category_correct[target_id] += 1
+
+                # Per-fifth accuracy (vectorized)
+                for f in range(num_fifths):
+                    start = f * fifth_size
+                    end = (f + 1) * fifth_size if f < num_fifths - 1 else seq_len
+                    fifth_total[f]   += pos_valid[:, start:end].sum().item()
+                    fifth_correct[f] += pos_correct[:, start:end].sum().item()
         
-        avg_loss = total_loss / total_samples
+        avg_loss = total_loss / total_sequences
         entity_accuracy = total_correct_entity / total_samples
         entity_top3_accuracy = total_correct_top3 / total_samples
         entity_top5_accuracy = total_correct_top5 / total_samples
@@ -1552,6 +1593,9 @@ class SequencePredictorTrainer:
             if category_total[target_id] > 0:
                 per_class_acc.append(category_correct[target_id] / category_total[target_id])
         mean_per_class_acc = np.mean(per_class_acc) if per_class_acc else 0.0
+
+        # Calculate per-fifth accuracy
+        fifth_accuracies = [(fifth_correct[i] / fifth_total[i]) if fifth_total[i] > 0 else 0.0 for i in range(num_fifths)]
         
         return {
             'loss': avg_loss,
@@ -1560,6 +1604,7 @@ class SequencePredictorTrainer:
             'entity_top5_accuracy': entity_top5_accuracy,
             'entity_top10_accuracy': entity_top10_accuracy,
             'mean_per_class_accuracy': mean_per_class_acc,
+            'per_fifth_accuracy': fifth_accuracies,
         }
 
 
@@ -1795,8 +1840,6 @@ def main():
                        help='Dropout rate (lower for larger model)')
     parser.add_argument('--grad_accum_steps', type=int, default=4,
                        help='Gradient accumulation steps (effective batch = 256)')
-    parser.add_argument('--teacher_forcing_ratio', type=float, default=1.0,
-                       help='Teacher forcing ratio (1.0 = always use teacher forcing for stable training)')
     parser.add_argument('--val_split', type=float, default=0.15,
                        help='Validation split ratio')
     parser.add_argument('--label_smoothing', type=float, default=0.1,
@@ -1809,8 +1852,8 @@ def main():
     # Enhanced model arguments
     parser.add_argument('--num_experts', type=int, default=8,
                        help='Number of experts in MoE layers')
-    parser.add_argument('--use_moe', action='store_true', default=True,
-                       help='Use Mixture of Experts')
+    parser.add_argument('--use_moe', action=argparse.BooleanOptionalAction, default=False,
+                   help='Use Mixture of Experts')
     parser.add_argument('--use_ngram', action='store_true', default=True,
                        help='Use N-gram feature extraction')
     parser.add_argument('--use_rope', action='store_true', default=True,
@@ -1823,11 +1866,15 @@ def main():
                        help='Use sequence augmentation during training')
     parser.add_argument('--augment_prob', type=float, default=0.2,
                        help='Probability of applying augmentation (lower for stability)')
+    parser.add_argument('--pos_weight_max', type=float, default=3.0,
+                       help='Max positional loss weight (position 0 = 1.0, position L-1 = this value)')
+    parser.add_argument('--late_focus_prob', type=float, default=0.4,
+                       help='Fraction of batches that train exclusively on the latter half of the sequence')
     
     # WandB arguments
     parser.add_argument('--wandb_entity', type=str, default=None,
                        help='Weights & Biases entity')
-    parser.add_argument('--wandb_project', type=str, default='DeepLearning-SimpleBuildOrder-Enhanced-Decoder',
+    parser.add_argument('--wandb_project', type=str, default='Build_Order_Prediction',
                        help='Weights & Biases project name')
     parser.add_argument('--wandb_run_name', type=str, default=None,
                        help='Weights & Biases run name')
@@ -1959,7 +2006,9 @@ def main():
         use_contrastive=args.use_contrastive,
         contrastive_weight=args.contrastive_weight,
         use_augmentation=args.use_augmentation,
-        augment_prob=args.augment_prob
+        augment_prob=args.augment_prob,
+        pos_weight_max=args.pos_weight_max,
+        late_focus_prob=args.late_focus_prob
     )
     
     # Initialize Weights & Biases
@@ -1977,7 +2026,6 @@ def main():
             'dim_feedforward': args.dim_feedforward,
             'max_seq_len': args.max_seq_len,
             'dropout': args.dropout,
-            'teacher_forcing_ratio': args.teacher_forcing_ratio,
             'grad_accum_steps': args.grad_accum_steps,
             'val_split': args.val_split,
             'entity_vocab_size': len(entity_vocab),
@@ -1997,6 +2045,8 @@ def main():
             'contrastive_weight': args.contrastive_weight,
             'use_augmentation': args.use_augmentation,
             'augment_prob': args.augment_prob,
+            'pos_weight_max': args.pos_weight_max,
+            'late_focus_prob': args.late_focus_prob,
         }
         
         try:
@@ -2032,10 +2082,7 @@ def main():
         
         for batch_idx, batch in enumerate(train_loader):
             # Training step
-            loss_dict = trainer.train_step(
-                batch,
-                teacher_forcing_ratio=args.teacher_forcing_ratio
-            )
+            loss_dict = trainer.train_step(batch)
             
             # Only track finite losses (skip NaN from skipped batches)
             if math.isfinite(loss_dict['loss']):
@@ -2059,22 +2106,6 @@ def main():
                 scheduler.step()
                 global_step += 1
             
-            # Log step-level training loss to W&B (only finite values)
-            if not args.no_wandb and math.isfinite(loss_dict.get('loss', float('nan'))):
-                step_log = {
-                    'step': global_step,
-                    'train_step/loss': loss_dict['loss'],
-                    'train_step/lr': optimizer.param_groups[0]['lr'],
-                }
-                if 'main_loss' in loss_dict and math.isfinite(loss_dict['main_loss']):
-                    step_log['train_step/main_loss'] = loss_dict['main_loss']
-                if 'contrastive_loss' in loss_dict and math.isfinite(loss_dict['contrastive_loss']):
-                    step_log['train_step/contrastive_loss'] = loss_dict['contrastive_loss']
-                if 'moe_aux_loss' in loss_dict and math.isfinite(loss_dict['moe_aux_loss']):
-                    step_log['train_step/moe_aux_loss'] = loss_dict['moe_aux_loss']
-                if grad_norm_count > 0:
-                    step_log['train_step/grad_norm'] = current_grad_norm
-                wandb.log(step_log, step=global_step)
             
             # Log batch progress
             if (batch_idx + 1) % 50 == 0:
@@ -2103,6 +2134,10 @@ def main():
         print(f"  Top-5 Accuracy: {val_metrics['entity_top5_accuracy']:.4f} ({val_metrics['entity_top5_accuracy']*100:.1f}%)")
         print(f"  Top-10 Accuracy: {val_metrics['entity_top10_accuracy']:.4f} ({val_metrics['entity_top10_accuracy']*100:.1f}%)")
         print(f"  Mean Per-Class Accuracy: {val_metrics['mean_per_class_accuracy']:.4f}")
+        fifth_accs = val_metrics.get('per_fifth_accuracy', [])
+        if fifth_accs:
+            fifth_str = '  |  '.join([f"Q{i+1}: {a*100:.1f}%" for i, a in enumerate(fifth_accs)])
+            print(f"  Per-Fifth Accuracy: {fifth_str}")
         
         # Get current learning rate
         current_lr = optimizer.param_groups[0]['lr']
@@ -2147,11 +2182,12 @@ def main():
         if not args.no_wandb:
             # Use average gradient norm computed DURING training (not after eval)
             avg_grad_norm = epoch_grad_norm / max(grad_norm_count, 1)
-            
-            wandb.log({
+            wandb_log_dict = {
                 'epoch': epoch + 1,
                 # Training metrics
                 'train/loss': avg_train_loss,
+                'train/learning_rate': current_lr,
+                'train/grad_norm': avg_grad_norm,
                 # Validation metrics
                 'val/loss': val_metrics['loss'],
                 'val/entity_accuracy': val_metrics['entity_accuracy'],
@@ -2159,16 +2195,16 @@ def main():
                 'val/entity_top5_accuracy': val_metrics['entity_top5_accuracy'],
                 'val/entity_top10_accuracy': val_metrics['entity_top10_accuracy'],
                 'val/mean_per_class_accuracy': val_metrics['mean_per_class_accuracy'],
-                # Training dynamics
-                'training/learning_rate': current_lr,
-                'training/grad_norm': avg_grad_norm,
-                'training/patience_counter': patience_counter,
+                # Per-fifth-of-sequence accuracy
+                **{f'val/per_fifth_accuracy_{i+1}': acc
+                   for i, acc in enumerate(val_metrics.get('per_fifth_accuracy', []))},
                 # Best metrics tracking
                 'best/val_loss': best_val_loss,
                 'best/val_accuracy': getattr(main, 'best_accuracy', 0),
                 'analysis/train_val_loss_gap': avg_train_loss - val_metrics['loss'],
-            })
-            
+                'training/patience_counter': patience_counter,
+            }
+            wandb.log(wandb_log_dict, step=epoch + 1)
             # Log example predictions every 5 epochs
             if (epoch + 1) % 5 == 0:
                 log_example_predictions(model, val_loader, entity_vocab, device, wandb)

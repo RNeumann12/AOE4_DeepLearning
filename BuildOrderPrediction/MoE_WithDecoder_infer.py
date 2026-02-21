@@ -11,7 +11,7 @@ Example:
   python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ English --enemy_civ French --map "Four Lakes" --build_steps 30 --greedy
   python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ French --enemy_civ French --map "Four Lakes" --build_steps 30 --greedy
   python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ abbasid_dynasty --enemy_civ English --map "Dry Arabia" --build_steps 30 --greedy
-  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ English --enemy_civ French --map "Dry Arabia" --build_steps 30 --greedy
+  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/new_model_best.pth --player_civ English --enemy_civ French --map "Dry Arabia" --build_steps 30 --greedy
 
     """
 import os
@@ -98,7 +98,6 @@ def load_model(checkpoint_path: str, device: torch.device):
         map_vocab_size=len(map_vocab),
         d_model=args.get('d_model', d_model),
         nhead=args.get('nhead', 8),
-        num_encoder_layers=args.get('num_encoder_layers', 4),
         num_decoder_layers=args.get('num_decoder_layers', 6),
         dim_feedforward=args.get('dim_feedforward', d_model * 4),
         dropout=0.0,  # No dropout for inference
@@ -184,11 +183,10 @@ def generate_build_order(
     enemy_civ = torch.tensor([enemy_civ_id], dtype=torch.long, device=device)
     map_tensor = torch.tensor([map_id], dtype=torch.long, device=device)
     
-    # Pre-compute encoder memory (key difference from encoder-only model!)
-    # This avoids re-encoding conditions at every generation step
+    # Pre-compute condition memory (avoids re-projecting conditions at every generation step)
     with torch.no_grad():
-        encoder_memory, map_emb = model.encode(player_civ, enemy_civ, map_tensor)  # (1, 1, d_model) each
-        print(f"  Encoder memory shape: {encoder_memory.shape}, Map emb shape: {map_emb.shape}")
+        condition_memory, map_emb = model.compute_condition_memory(player_civ, enemy_civ, map_tensor)  # (1, 1, d_model) each
+        print(f"  Condition memory shape: {condition_memory.shape}, Map emb shape: {map_emb.shape}")
     
     # Create valid entity mask if civ_entity_mapping is available
     valid_entity_mask = None
@@ -238,7 +236,7 @@ def generate_build_order(
             entity_logits = model(
                 entity_seq,
                 player_civ, enemy_civ, map_tensor,
-                encoder_memory=encoder_memory,  # Pre-computed encoder output
+                condition_memory=condition_memory,  # Pre-computed condition memory
                 predict_next=True
             )
             
@@ -323,7 +321,7 @@ def generate_build_order(
             logits = model(
                 prefix_seq,
                 player_civ, enemy_civ, map_tensor,
-                encoder_memory=encoder_memory,
+                condition_memory=condition_memory,
                 predict_next=True
             )
             
