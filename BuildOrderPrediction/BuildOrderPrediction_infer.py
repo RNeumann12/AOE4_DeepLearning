@@ -131,6 +131,9 @@ def load_model_from_checkpoint(ckpt_path: str, device: torch.device):
         perm_mask[:, 0] = False
         model.set_civ_entity_mask(perm_mask.to(device))
 
+    # Store inverted event vocab on model for use in generation masking
+    model._inv_event_vocab = inv_ev
+    
     inv_vocabs = {'entity': inv_ent, 'event': inv_ev}
     return model, vocabs, inv_vocabs
 
@@ -332,13 +335,15 @@ def pretty_print_build(sequence_entities, sequence_events, sequence_times, inv_e
     return "\n".join(lines)
 
 
-def print_step_probabilities(step_probs_list, inv_ent, top_n=5):
+def print_step_probabilities(step_probs_list, inv_ent, inv_ev=None, top_n=5, show_times=True):
     """Print probability distributions for top entities at each generation step.
     
     Args:
         step_probs_list: List of dicts with 'probs' (tensor) and 'selected' (int) for each step
         inv_ent: Inverted entity vocabulary (id -> name)
+        inv_ev: Inverted event vocabulary (id -> name), optional
         top_n: Number of top entities to display
+        show_times: Whether to display time predictions
     """
     print("\n" + "=" * 70)
     print("STEP-BY-STEP PROBABILITY DISTRIBUTIONS")
@@ -349,10 +354,23 @@ def print_step_probabilities(step_probs_list, inv_ent, top_n=5):
         selected_id = step_data['selected']
         selected_name = inv_ent.get(selected_id, '<UNK>')
         
+        # Get time info if available
+        time_info = ""
+        if show_times and 'time_delta' in step_data and 'cumulative_time' in step_data:
+            time_delta = step_data['time_delta']
+            cumulative_time = step_data['cumulative_time']
+            time_info = f" | Δt={time_delta:.1f}s, T={cumulative_time:.1f}s"
+        
+        # Get event info if available
+        event_info = ""
+        if inv_ev is not None and 'selected_event' in step_data:
+            event_name = inv_ev.get(step_data['selected_event'], '<UNK>')
+            event_info = f" [{event_name}]"
+        
         # Get top N probabilities and indices
         top_vals, top_idx = torch.topk(probs, min(top_n, probs.size(-1)))
         
-        print(f"\nStep {step_idx + 1}: Selected → {selected_name}")
+        print(f"\nStep {step_idx + 1}: Selected → {selected_name}{event_info}{time_info}")
         print("-" * 50)
         
         for rank, (prob, idx) in enumerate(zip(top_vals.tolist(), top_idx.tolist())):
@@ -422,6 +440,15 @@ def generate_with_probabilities(model, player_civ, enemy_civ, max_length, device
             event_logits = (model.event_head(last_output) / temperature).squeeze(0).squeeze(0)
             time_delta = torch.relu(model.time_head(last_output)).squeeze()
             
+            # Mask out UNKNOWN and PAD events - they should never be generated
+            # Index 0 is typically <PAD>, look up UNKNOWN dynamically
+            event_logits[0] = -1e9  # <PAD>
+            if hasattr(model, '_inv_event_vocab'):
+                for ev_id, ev_name in model._inv_event_vocab.items():
+                    ev_upper = ev_name.upper()
+                    if 'UNK' in ev_upper or 'PAD' in ev_upper:
+                        event_logits[ev_id] = -1e9
+            
             # Apply civ-based mask if available
             if hasattr(model, 'civ_entity_mask') and model.civ_entity_mask is not None:
                 civ_id = player_civ[0]
@@ -469,7 +496,9 @@ def generate_with_probabilities(model, player_civ, enemy_civ, max_length, device
                 'probs': entity_probs.cpu(),
                 'selected': selected_entity,
                 'event_probs': event_probs.cpu(),
-                'selected_event': selected_event
+                'selected_event': selected_event,
+                'time_delta': float(time_delta.item()),
+                'cumulative_time': new_time
             })
             
             # Update sequences
@@ -567,10 +596,15 @@ def main():
         # Load dataset with the same vocabs as the model
         df = pd.read_csv(args.eval_csv)
         
-        # Determine max_len
+        # Determine max_len - IMPORTANT: limit to model's positional embedding size
+        # to avoid out-of-bounds GPU memory access (HSA_STATUS_ERROR_EXCEPTION)
         grouped = df.groupby(['game_id', 'profile_id']).size()
         dataset_longest = int(grouped.max()) if len(grouped) > 0 else 0
+        model_max_len = model.seq_pos_embed.num_embeddings  # Model's position embedding limit
         desired_max_len = args.max_len if args.max_len is not None else min(dataset_longest, 1024)
+        if desired_max_len > model_max_len:
+            print(f"Warning: Requested max_len={desired_max_len} exceeds model's positional embedding size ({model_max_len}). Clamping to {model_max_len}.")
+            desired_max_len = model_max_len
         
         dataset = AoEEventDataset(
             args.eval_csv, 
@@ -666,7 +700,7 @@ def main():
                 print(f"  (top_p={args.sample_top_p})")
             print()
             print(pretty_print_build(ents, evs, times, inv_ent, inv_ev))
-            print_step_probabilities(step_probs, inv_ent, top_n=args.top_probs)
+            print_step_probabilities(step_probs, inv_ent, inv_ev=inv_ev, top_n=args.top_probs, show_times=True)
         else:
             # Standard greedy decoding
             sequences, win_probs = model.beam_search_generate(

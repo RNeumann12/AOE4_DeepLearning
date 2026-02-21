@@ -6,7 +6,7 @@ Usage:
 python BuildOrderPrediction/BuildOrderPrediction_train.py \
   --csv transformer_input_new.csv \
   --epochs 50 \
-  --label_smoothing 0.15 \
+  --label_smoothing 0.2 \
   --truncation_strategy head \
   --max_len 256
   """
@@ -65,6 +65,92 @@ def build_civ_entity_mask(dataset, entity_vocab, num_civs):
     return mask
 
 
+def compute_entity_class_weights(df, entity_vocab, filter_events=None, filter_entities=None):
+    """Compute class weights for entity loss using log-dampened inverse frequency.
+    
+    This addresses class imbalance by giving higher weights to rare entities
+    (like military units) and lower weights to common entities (like Villagers).
+    
+    Args:
+        df: pandas DataFrame with entity data
+        entity_vocab: Entity vocabulary (token -> id)
+        filter_events: List of event types to EXCLUDE (e.g., ['DESTROY'])
+        filter_entities: List of entity names to EXCLUDE (e.g., ['Sheep'])
+        
+    Returns:
+        weights: (vocab_size,) tensor of class weights
+    """
+    import pandas as pd
+    
+    # Apply same filtering as training
+    if filter_events:
+        df = df[~df['event'].isin(filter_events)]
+    
+    if filter_entities:
+        df = df[~df['entity'].isin(filter_entities)]
+    
+    # Filter out events at timestamp 0 (outside player control)
+    if 'time' in df.columns:
+        df = df[df['time'] > 0]
+    
+    # Count entity frequencies
+    entity_counts = df['entity'].astype(str).value_counts()
+    total_count = entity_counts.sum()
+    
+    # Sqrt inverse frequency weighting - more aggressive than log-dampening
+    # Formula: weight = sqrt(median_count / count)
+    # This gives Villager (~35% of data) a weight of ~0.3 and rare units get up to 5x
+    vocab_size = len(entity_vocab) + 1
+    weights = torch.ones(vocab_size)
+    
+    median_count = entity_counts.median()
+    
+    for entity_name, entity_id in entity_vocab.items():
+        if entity_name in ['<PAD>', '<UNK>']:
+            weights[entity_id] = 0.0  # Don't penalize special tokens
+            continue
+            
+        count = entity_counts.get(entity_name, 1)
+        
+        # Sqrt inverse frequency - more aggressive than log-dampening
+        raw_weight = np.sqrt(median_count / max(count, 1))
+        
+        # Explicit Villager penalty - further reduce its weight
+        if entity_name in ['Villager', 'Gilded Villager']:
+            raw_weight *= 0.3  # Additional 70% penalty for Villagers
+        
+        weights[entity_id] = max(0.05, min(raw_weight, 20.0))  # Wider range for more diversity
+    
+    # Normalize to mean = 1.0 for non-special tokens
+    valid_mask = weights > 0
+    if valid_mask.sum() > 0:
+        weights[valid_mask] = weights[valid_mask] / weights[valid_mask].mean()
+    
+    # Print summary
+    print(f"\n{'='*60}")
+    print(f"Entity Class Weights Summary (Log-Dampened Inverse Frequency)")
+    print(f"{'='*60}")
+    print(f"  Total entity types: {len(entity_counts)}")
+    print(f"  Weight range: [{weights[valid_mask].min():.4f}, {weights[valid_mask].max():.4f}]")
+    
+    # Show some examples
+    inv_vocab = {v: k for k, v in entity_vocab.items()}
+    weight_list = [(inv_vocab.get(i, f'id_{i}'), weights[i].item()) for i in range(vocab_size) if weights[i] > 0]
+    weight_list.sort(key=lambda x: x[1])
+    
+    print(f"\n  Lowest weights (high-frequency entities - e.g., Villager):")
+    for name, w in weight_list[:5]:
+        print(f"    {name}: {w:.4f}")
+    
+    print(f"\n  Highest weights (low-frequency entities - e.g., military units):")
+    for name, w in weight_list[-5:]:
+        print(f"    {name}: {w:.4f}")
+    
+    print(f"{'='*60}\n")
+    
+    return weights
+
+
 def evaluate(trainer, dataloader, device, teacher_forcing_ratio=1.0):
     """Evaluate the model.
     
@@ -107,7 +193,10 @@ def evaluate(trainer, dataloader, device, teacher_forcing_ratio=1.0):
                 target_win_prob=None, # batch.get('labels', None) -> not used during eval to prevent leakage
                 teacher_forcing_ratio=teacher_forcing_ratio,  # configurable teacher forcing
                 ground_truth=(batch['entity_ids'], batch['event_ids'], batch['times']),
-                allowed_entities_mask=allowed
+                allowed_entities_mask=allowed,
+                # Use temperature sampling for AR mode to prevent mode collapse
+                temperature=0.8 if teacher_forcing_ratio < 1.0 else 1.0,
+                top_k=50 if teacher_forcing_ratio < 1.0 else 0
             )
             loss, _ = trainer.compute_loss(preds, (batch['entity_ids'], batch['event_ids'], batch['times']), preds[-1], batch.get('labels', None))
             losses.append(loss.item())
@@ -238,8 +327,25 @@ def main(args):
     reward_model = load_pretrained_win_model(args.reward_model_path, device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
-    trainer = BuildOrderTrainer(model, optimizer, device=device, use_amp=args.use_amp, grad_accum_steps=args.grad_accum_steps,
-                                reward_model=reward_model, label_smoothing=args.label_smoothing)
+    # Compute entity class weights for focal loss (addresses class imbalance)
+    entity_class_weights = None
+    if args.use_focal_loss:
+        entity_class_weights = compute_entity_class_weights(
+            df, vocabs['entity_vocab'], 
+            filter_events=filter_events, 
+            filter_entities=filter_entities
+        ).to(device)
+
+    trainer = BuildOrderTrainer(
+        model, optimizer, device=device, 
+        use_amp=args.use_amp, 
+        grad_accum_steps=args.grad_accum_steps,
+        reward_model=reward_model, 
+        label_smoothing=args.label_smoothing,
+        use_focal_loss=args.use_focal_loss,
+        focal_gamma=args.focal_gamma,
+        entity_class_weights=entity_class_weights
+    )
     best_val_loss = float('inf')
     remediation_attempts = 0
     max_remediations = 3
@@ -253,8 +359,9 @@ def main(args):
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device)
-            # Scheduled teacher forcing: decay linearly from 1.0 to 0.0
-            current_tf = max(0.0, 1.0 - (epoch / args.epochs))
+            # Exponential TF decay: faster transition to AR mode
+            # This helps the model learn to handle its own predictions earlier
+            current_tf = max(0.0, 0.9 ** epoch)
             try:
                 loss_dict = trainer.train_step(batch, teacher_forcing_ratio=current_tf)
             except RuntimeError as e:
@@ -366,6 +473,9 @@ if __name__ == '__main__':
     parser.add_argument('--grad_accum_steps', type=int, default=1, help='Number of steps to accumulate gradients before stepping optimizer')
     parser.add_argument('--use_amp', action='store_true', default=True, help='Use automatic mixed precision (AMP) to reduce memory')
     parser.add_argument('--label_smoothing', type=float, default=0.1, help='Label smoothing factor to prevent overconfidence on common classes like Villager')
+    parser.add_argument('--use_focal_loss', action='store_true', default=True, help='Use Focal Loss to address class imbalance (prevents always predicting Villager)')
+    parser.add_argument('--no_focal_loss', dest='use_focal_loss', action='store_false', help='Disable Focal Loss')
+    parser.add_argument('--focal_gamma', type=float, default=2.0, help='Focal loss gamma parameter (higher = more focus on hard examples)')
     parser.add_argument('--use_wandb', dest='use_wandb', action='store_true', default=True, help='Enable Weights & Biases logging')
     parser.add_argument('--no-wandb', dest='use_wandb', action='store_false', help='Disable Weights & Biases logging')
     parser.add_argument('--wandb_entity', type=str, default=None, help='W&B entity/username')
