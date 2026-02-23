@@ -11,9 +11,12 @@ Example:
   python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ English --enemy_civ French --map "Four Lakes" --build_steps 30 --greedy
   python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ French --enemy_civ French --map "Four Lakes" --build_steps 30 --greedy
   python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ abbasid_dynasty --enemy_civ English --map "Dry Arabia" --build_steps 30 --greedy
-  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/new_model_best.pth --player_civ English --enemy_civ French --map "Dry Arabia" --build_steps 30 --greedy
-
-    """
+  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ English --enemy_civ French --map "Dry Arabia" --build_steps 30 --greedy --lora_checkpoint BuildOrderPrediction/lora_patch_15.3.8338.pth
+     
+python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ sengoku_daimyo --enemy_civ French --map "Dry Arabia" --build_steps 30 --greedy --lora_checkpoint BuildOrderPrediction/lora_patch_15.3.8338.pth
+python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ knights_templar --enemy_civ French --map "Dry Arabia" --build_steps 30 --greedy --lora_checkpoint BuildOrderPrediction/lora_patch_15.3.8338.pth
+python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ knights_templar --enemy_civ French --map "Dry Arabia" --build_steps 50 --lora_checkpoint BuildOrderPrediction/lora_patch_15.3.8338.pth
+       """
 import os
 import sys
 import argparse
@@ -27,7 +30,8 @@ repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if repo_root not in sys.path:
     sys.path.insert(0, repo_root)
 
-from MoE_WithDecoder_train import SequencePredictor
+from BuildOrderPrediction.MoE_WithDecoder_train import SequencePredictor
+from BuildOrderPrediction.MoE_WithDecoder_lora_train import apply_lora_to_model
 
 
 def invert_vocab(vocab: Dict[str, int]) -> Dict[int, str]:
@@ -56,11 +60,35 @@ def find_vocab_id(name: str, vocab: Dict[str, int], vocab_name: str = "vocab") -
     sys.exit(1)
 
 
-def load_model(checkpoint_path: str, device: torch.device):
-    """Load MoE WithDecoder model and vocabularies from checkpoint."""
+def load_model(
+    checkpoint_path: str,
+    device: torch.device,
+    lora_checkpoint_path: Optional[str] = None,
+):
+    """Load MoE WithDecoder model and vocabularies from checkpoint.
+
+    Optionally applies a LoRA adapter on top of the base model.
+
+    Load order is critical when a LoRA checkpoint is provided:
+      1. Build model architecture
+      2. Load BASE weights into plain nn.Linear layers
+      3. Inject LoRALinear wrappers (replaces nn.Linear in-place)
+      4. Load LoRA A/B matrices with strict=False
+
+    Loading base weights BEFORE injection is required because injection
+    renames state dict keys (e.g. ffn.0.weight → ffn.0.base_linear.weight).
+
+    Args:
+        checkpoint_path: Path to the base model .pth checkpoint
+        device: Torch device to load onto
+        lora_checkpoint_path: Optional path to a LoRA adapter .pth checkpoint
+
+    Returns:
+        (model, entity_vocab, civ_vocab, map_vocab, civ_entity_mapping)
+    """
     print(f"Loading checkpoint from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
-    
+
     # Extract vocabularies
     entity_vocab = checkpoint['entity_vocab']
     civ_vocab = checkpoint['civ_vocab']
@@ -78,19 +106,19 @@ def load_model(checkpoint_path: str, device: torch.device):
         print(f"  Civ-entity mapping: {len(civ_entity_mapping)} civilizations")
     else:
         print("  Warning: No civ-entity mapping in checkpoint (older model)")
-    
+
     print(f"  Entity vocab size: {len(entity_vocab)}")
     print(f"  Civ vocab size: {len(civ_vocab)}")
     print(f"  Map vocab size: {len(map_vocab)}")
-    
+
     # Infer model dimensions from state dict
     state_dict = checkpoint['model_state_dict']
     d_model = state_dict['entity_embed.weight'].shape[1]
-    
+
     # Check architecture type
     architecture = checkpoint.get('architecture', 'SequencePredictor_WithDecoder')
     print(f"  Architecture: {architecture}")
-    
+
     # Get model config from args or use defaults
     model = SequencePredictor(
         vocab_size_entity=len(entity_vocab),
@@ -107,17 +135,53 @@ def load_model(checkpoint_path: str, device: torch.device):
         use_ngram=args.get('use_ngram', True),
         use_rope=args.get('use_rope', True)
     ).to(device)
-    
+
+    # Step 2: load BASE weights (must happen before LoRA injection)
     model.load_state_dict(state_dict)
+
+    # Step 3 & 4: optionally apply LoRA adapter
+    if lora_checkpoint_path is not None:
+        print(f"\n  [LoRA] Loading adapter from: {lora_checkpoint_path}")
+        lora_ckpt = torch.load(lora_checkpoint_path, map_location=device, weights_only=False)
+
+        lora_config = lora_ckpt['lora_config']
+        lora_sd = lora_ckpt['lora_state_dict']
+        patch_id = lora_ckpt.get('patch_id', 'unknown')
+        val_metrics = lora_ckpt.get('val_metrics', {})
+
+        # Inject LoRALinear wrappers AFTER base weights are loaded
+        apply_lora_to_model(
+            model,
+            rank=lora_config['rank'],
+            alpha=lora_config['alpha'],
+            target_modules=lora_config['target_modules'],
+        )
+
+        # Load LoRA A/B matrices — strict=False because base params are not in lora_sd
+        missing_keys, unexpected_keys = model.load_state_dict(lora_sd, strict=False)
+        if unexpected_keys:
+            print(f"  [LoRA] WARNING: unexpected keys in adapter checkpoint: {unexpected_keys[:5]}")
+
+        n_loaded = len(lora_sd) - len(unexpected_keys)
+        val_loss_str = f"{val_metrics['val_loss']:.4f}" if 'val_loss' in val_metrics else "N/A"
+        print(
+            f"  [LoRA] Adapter applied: rank={lora_config['rank']}, "
+            f"alpha={lora_config['alpha']}, patch='{patch_id}', "
+            f"val_loss={val_loss_str}, tensors loaded={n_loaded}"
+        )
+        print(f"  Mode: BASE + LoRA ADAPTER (patch='{patch_id}')")
+    else:
+        print("  Mode: BASE ONLY (no LoRA adapter)")
+
     model.eval()
-    
+
     # Print model info
     total_params = sum(p.numel() for p in model.parameters())
     print(f"  Model parameters: {total_params:,}")
     print(f"  MoE enabled: {model.use_moe}")
     print(f"  N-gram enabled: {model.use_ngram}")
     print(f"  RoPE enabled: {model.use_rope}")
-    
+
     return model, entity_vocab, civ_vocab, map_vocab, civ_entity_mapping
 
 
@@ -528,7 +592,15 @@ def main():
                        help='List available civilizations and exit')
     parser.add_argument('--list_maps', action='store_true',
                        help='List available maps and exit')
-    
+
+    # LoRA adapter (optional)
+    parser.add_argument('--lora_checkpoint', type=str, default=None,
+                       help=(
+                           'Optional path to a LoRA adapter checkpoint (.pth). '
+                           'When provided, applies the patch-specific adapter on top '
+                           'of the base model. Generated by MoE_WithDecoder_lora_train.py.'
+                       ))
+
     args = parser.parse_args()
     
     # Device selection
@@ -538,9 +610,9 @@ def main():
         device = torch.device(args.device)
     print(f"Using device: {device}")
     
-    # Load model
+    # Load model (with optional LoRA adapter)
     model, entity_vocab, civ_vocab, map_vocab, civ_entity_mapping = load_model(
-        args.checkpoint, device
+        args.checkpoint, device, lora_checkpoint_path=args.lora_checkpoint
     )
     
     # Handle list commands
