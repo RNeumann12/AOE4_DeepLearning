@@ -15,7 +15,8 @@ class StrategyUnsupervisedEncoder(nn.Module):
     nearest-neighbour retrieval, etc.).
     """
 
-    def __init__(self, vocab_sizes, embedding_dim: int = 64, hidden_dim: int = 256, embed_out: int = 128):
+    def __init__(self, vocab_sizes, embedding_dim: int = 64, hidden_dim: int = 256, embed_out: int = 128,
+                 seq_dropout: float = 0.1, proj_dropout: float = 0.3):
         super(StrategyUnsupervisedEncoder, self).__init__()
 
         # Sequence embeddings
@@ -38,8 +39,12 @@ class StrategyUnsupervisedEncoder(nn.Module):
         self.project = nn.Sequential(
             nn.Linear(proj_in, proj_in // 2),
             nn.ReLU(),
+            nn.Dropout(proj_dropout),
             nn.Linear(proj_in // 2, embed_out),
         )
+
+        # dropout on sequence inputs (applied before packing) and projection
+        self.seq_dropout = nn.Dropout(seq_dropout)
 
         # optional normalization (useful for clustering / similarity)
         self.normalize = True
@@ -72,6 +77,8 @@ class StrategyUnsupervisedEncoder(nn.Module):
 
         # Sequence input concat
         seq_input = torch.cat([entity_emb, event_emb, type_emb, age_emb, time, villagers], dim=-1)
+        # apply small dropout to sequence inputs to regularize encoder
+        seq_input = self.seq_dropout(seq_input)
 
         # Pack using lengths from mask
         lengths = mask.sum(dim=1).long().cpu()

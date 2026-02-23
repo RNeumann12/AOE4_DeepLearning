@@ -18,6 +18,8 @@ import torch.nn as nn
 from tqdm import tqdm
 from sklearn.cluster import KMeans
 from sklearn.manifold import TSNE
+from sklearn.metrics import silhouette_score
+from sklearn.decomposition import PCA
 import matplotlib.pyplot as plt
 
 from model_unsupervised import StrategyUnsupervisedEncoder
@@ -54,18 +56,31 @@ def load_npz(path: str = "aoe4_dataset.npz"):
     return X_seq, X_mask, X_meta, vocabs
 
 
-def augment(sequence: np.ndarray, mask: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-    """Very small augmentation: randomly drop a few time steps (zero them).
-    Keep masks consistent."""
+def augment(sequence: np.ndarray, mask: np.ndarray, dropout_prob: float = 0.1) -> Tuple[np.ndarray, np.ndarray]:
+    """Augment by dropping random timesteps and token dropout.
+    - timestep dropout: zero a small fraction of timesteps (contiguous or random)
+    - token/entity dropout: with `dropout_prob` randomly zero entity/event tokens
+    Returns augmented (seq, mask).
+    """
     seq = sequence.copy()
     m = mask.copy()
     batch, seq_len, feat = seq.shape
+
+    # timestep dropout: drop up to 5% timesteps per sample
     for i in range(batch):
-        # drop up to 5% of timesteps
         k = max(1, int(seq_len * 0.05))
         idx = np.random.choice(seq_len, k, replace=False)
         seq[i, idx, :] = 0
         m[i, idx] = 0
+
+    # token/entity dropout: randomly zero out entity/event columns per timestep
+    # entity at index 0, event at index 1
+    if dropout_prob > 0:
+        mask_tokens = np.random.rand(batch, seq_len) < dropout_prob
+        # zero entity and event tokens on masked positions
+        seq[mask_tokens, 0] = 0
+        seq[mask_tokens, 1] = 0
+
     return seq, m
 
 
@@ -127,6 +142,7 @@ def train(args):
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
 
     loss_history = []
+    silhouette_history = []
     for epoch in range(args.epochs):
         model.train()
         total_loss = 0.0
@@ -134,14 +150,24 @@ def train(args):
         num_batches = int(np.ceil(len(train_idx) / args.batch_size))
         pbar = tqdm(total=num_batches, desc=f"Epoch {epoch+1}", leave=False)
         for seq_b, mask_b, meta_b in batch_generator(train_idx):
-            # create two augmentations
-            seq1, mask1 = augment(seq_b.numpy(), mask_b.numpy())
-            seq2, mask2 = augment(seq_b.numpy(), mask_b.numpy())
-
-            seq1 = torch.from_numpy(seq1).to(device).float()
-            seq2 = torch.from_numpy(seq2).to(device).float()
-            mask1 = torch.from_numpy(mask1).to(device)
-            mask2 = torch.from_numpy(mask2).to(device)
+            # create two augmentations or use minimal jitter when augmentation disabled
+            if args.augment:
+                seq1, mask1 = augment(seq_b.numpy(), mask_b.numpy(), dropout_prob=args.dropout)
+                seq2, mask2 = augment(seq_b.numpy(), mask_b.numpy(), dropout_prob=args.dropout)
+            else:
+                # minimal jitter: keep sequences identical except tiny noise on continuous cols (time, villagers)
+                seq_np = seq_b.numpy()
+                seq1 = seq_np.copy()
+                seq2 = seq_np.copy()
+                # add tiny gaussian noise to time (col 4) and villagers (col 5)
+                noise = np.random.normal(scale=1e-3, size=seq2[:, :, 4:6].shape)
+                seq2[:, :, 4:6] = seq2[:, :, 4:6] + noise
+                mask1 = mask_b.numpy()
+                mask2 = mask_b.numpy()
+                seq1 = torch.from_numpy(seq1).to(device).float()
+                seq2 = torch.from_numpy(seq2).to(device).float()
+                mask1 = torch.from_numpy(mask1).to(device)
+                mask2 = torch.from_numpy(mask2).to(device)
             meta = meta_b.to(device)
 
             z1 = model(seq1, mask1, meta)
@@ -167,6 +193,39 @@ def train(args):
         np.save(os.path.join(args.out_dir, "loss_history.npy"), np.array(loss_history))
         print(f"Epoch {epoch+1}/{args.epochs} - avg_loss: {avg_loss:.4f}")
 
+        # Silhouette monitoring on a validation subset
+        try:
+            model.eval()
+            val_n = len(val_idx)
+            sample_n = min(val_n, args.silhouette_sample)
+            if sample_n > 0:
+                sel = np.random.choice(val_idx, sample_n, replace=False)
+                with torch.no_grad():
+                    seq_v = torch.from_numpy(X_seq[sel]).float().to(device)
+                    mask_v = torch.from_numpy(X_mask[sel]).to(device)
+                    meta_v = torch.from_numpy(X_meta[sel]).long().to(device)
+                    emb_v = model(seq_v, mask_v, meta_v).cpu().numpy()
+
+                # optionally reduce dimensionality for stability
+                if emb_v.shape[0] > 1000 and emb_v.shape[1] > 10:
+                    pca = PCA(n_components=min(50, emb_v.shape[1]))
+                    emb_red = pca.fit_transform(emb_v)
+                else:
+                    emb_red = emb_v
+
+                km = KMeans(n_clusters=args.n_clusters, random_state=0)
+                lab = km.fit_predict(emb_red)
+                if len(set(lab)) > 1:
+                    sil = silhouette_score(emb_red, lab)
+                else:
+                    sil = float('nan')
+                silhouette_history.append(sil)
+                np.save(os.path.join(args.out_dir, "silhouette_history.npy"), np.array(silhouette_history))
+                print(f"  silhouette (sample {sample_n}): {sil:.4f}")
+
+        except Exception as e:
+            print(f"Silhouette monitoring skipped due to error: {e}")
+
     # after training, compute embeddings for all games
     model.eval()
     with torch.no_grad():
@@ -183,23 +242,53 @@ def train(args):
     all_emb = np.vstack(all_emb)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # clustering
+    # clustering with KMeans (baseline)
     kmeans = KMeans(n_clusters=args.n_clusters, random_state=0)
     labels = kmeans.fit_predict(all_emb)
-    np.savetxt(os.path.join(args.out_dir, "cluster_labels.csv"), labels, fmt="%d")
+    np.savetxt(os.path.join(args.out_dir, "cluster_labels_kmeans.csv"), labels, fmt="%d")
 
-    # t-SNE plot
-    tsne = TSNE(n_components=2, random_state=0)
-    proj = tsne.fit_transform(all_emb)
-    plt.figure(figsize=(8, 6))
-    sc = plt.scatter(proj[:, 0], proj[:, 1], c=labels, cmap="tab10", s=6)
-    plt.colorbar(sc, label="cluster")
-    plt.title("Unsupervised clusters (t-SNE)")
-    plt.tight_layout()
-    plt.savefig(os.path.join(args.out_dir, "clusters_tsne.png"), dpi=150)
-    plt.close()
+    # t-SNE plot of KMeans clusters
+    try:
+        tsne = TSNE(n_components=2, random_state=0)
+        proj = tsne.fit_transform(all_emb)
+        plt.figure(figsize=(8, 6))
+        sc = plt.scatter(proj[:, 0], proj[:, 1], c=labels, cmap="tab10", s=6)
+        plt.colorbar(sc, label="cluster")
+        plt.title("KMeans clusters (t-SNE)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.out_dir, "clusters_kmeans_tsne.png"), dpi=150)
+        plt.close()
+    except Exception:
+        print("t-SNE plot failed; skipping t-SNE visualization")
 
-    print(f"Saved labels and plot to {args.out_dir}")
+    # Try UMAP + HDBSCAN for density-based clustering (optional)
+    try:
+        import umap
+        import hdbscan
+
+        print("Running UMAP + HDBSCAN...")
+        reducer = umap.UMAP(n_components=min(10, all_emb.shape[1]), random_state=0)
+        emb_umap = reducer.fit_transform(all_emb)
+
+        clusterer = hdbscan.HDBSCAN(min_cluster_size=args.hdb_min_cluster_size, min_samples=args.hdb_min_samples)
+        hdb_labels = clusterer.fit_predict(emb_umap)
+        np.savetxt(os.path.join(args.out_dir, "cluster_labels_hdbscan.csv"), hdb_labels, fmt="%d")
+
+        # 2D visualization (UMAP to 2D)
+        reducer2 = umap.UMAP(n_components=2, random_state=1)
+        emb2d = reducer2.fit_transform(all_emb)
+        plt.figure(figsize=(8, 6))
+        sc = plt.scatter(emb2d[:, 0], emb2d[:, 1], c=hdb_labels, cmap="tab10", s=6)
+        plt.colorbar(sc, label="hdbscan_cluster")
+        plt.title("HDBSCAN clusters (UMAP 2D)")
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.out_dir, "clusters_hdbscan_umap.png"), dpi=150)
+        plt.close()
+        print(f"Saved HDBSCAN labels and UMAP plot to {args.out_dir}")
+    except Exception as e:
+        print(f"UMAP+HDBSCAN skipped (missing packages or error): {e}")
+
+    print(f"Saved KMeans labels and plots to {args.out_dir}")
 
 
 def cli():
@@ -211,9 +300,14 @@ def cli():
     parser.add_argument("--temperature", type=float, default=0.5)
     parser.add_argument("--embed_dim", type=int, default=128)
     parser.add_argument("--n_clusters", type=int, default=5)
-    parser.add_argument("--val_split", type=float, default=0.1)
+    parser.add_argument("--val_split", type=float, default=0.2)
     parser.add_argument("--out_dir", type=str, default="outputs/unsup")
     parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--augment", action="store_true", default=False, help="Enable data augmentations during contrastive training")
+    parser.add_argument("--dropout", type=float, default=0.3, help="Token/entity dropout probability used when augmenting")
+    parser.add_argument("--silhouette_sample", type=int, default=1000, help="Number of validation samples to compute silhouette per epoch (0 to disable)")
+    parser.add_argument("--hdb_min_cluster_size", type=int, default=20)
+    parser.add_argument("--hdb_min_samples", type=int, default=5)
     args = parser.parse_args()
     train(args)
 
