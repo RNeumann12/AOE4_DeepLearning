@@ -15,7 +15,7 @@ class StrategyUnsupervisedEncoder(nn.Module):
     nearest-neighbour retrieval, etc.).
     """
 
-    def __init__(self, vocab_sizes, embedding_dim: int = 256, seq_dropout: float = 0.1, proj_dropout: float = 0.3,hidden_dim: int = 256, embed_out: int = 128):
+    def __init__(self, vocab_sizes, embedding_dim: int = 256, seq_dropout: float = 0.1, proj_dropout: float = 0.3,hidden_dim: int = 128, embed_out: int = 128):
         super(StrategyUnsupervisedEncoder, self).__init__()
 
         # Sequence embeddings
@@ -47,6 +47,15 @@ class StrategyUnsupervisedEncoder(nn.Module):
 
         # optional normalization (useful for clustering / similarity)
         self.normalize = True
+        
+        # Autoencoder decoder: reconstructs sequence features from embedding
+        # Decoder takes embedding and expands to sequence length, outputs 6 features per timestep
+        self.decoder = nn.Sequential(
+            nn.Linear(embed_out, 256),
+            nn.ReLU(),
+            nn.Dropout(proj_dropout),
+            nn.Linear(256, 6)  # entity, event, type, age, time, villagers
+        )
 
     def forward(self, sequence: torch.Tensor, mask: torch.Tensor, metadata: torch.Tensor) -> torch.Tensor:
         """
@@ -107,8 +116,15 @@ class StrategyUnsupervisedEncoder(nn.Module):
         emb = self.project(combined)
         if self.normalize:
             emb = F.normalize(emb, p=2, dim=-1)
+        
+        # Decode: reconstruct sequence from embedding
+        batch_size, seq_len = sequence.shape[0], sequence.shape[1]
+        # Expand embedding to sequence length: (batch, embed_out) -> (batch, seq_len, embed_out)
+        emb_expanded = emb.unsqueeze(1).expand(-1, seq_len, -1)  # (batch, seq_len, embed_out)
+        # Decode each timestep: (batch, seq_len, embed_out) -> (batch, seq_len, 6)
+        reconstructed = self.decoder(emb_expanded)
 
-        return emb
+        return emb, reconstructed
 
 
 if __name__ == "__main__":
@@ -127,3 +143,11 @@ if __name__ == "__main__":
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total params: {total:,}, trainable: {trainable:,}")
+    
+    # Test forward pass
+    batch_size, seq_len = 4, 50
+    seq = torch.randn(batch_size, seq_len, 6)
+    mask = torch.ones(batch_size, seq_len)
+    meta = torch.randint(0, 20, (batch_size, 3))
+    emb, recon = model(seq, mask, meta)
+    print(f"Embedding shape: {emb.shape}, Reconstructed shape: {recon.shape}")
