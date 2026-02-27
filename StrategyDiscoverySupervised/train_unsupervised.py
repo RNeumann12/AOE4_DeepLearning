@@ -13,6 +13,7 @@ import argparse
 from typing import Tuple
 
 import numpy as np
+import json
 import torch
 import torch.nn as nn
 from tqdm import tqdm
@@ -138,11 +139,15 @@ def train(args):
             seq, mask, meta = collate_from_arrays(X_seq, X_mask, X_meta, batch_idx)
             yield seq, mask, meta
 
-    model = StrategyUnsupervisedEncoder(vocabs, embed_out=args.embed_dim).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    model = StrategyUnsupervisedEncoder(vocabs, embed_out=args.embed_dim, seq_dropout=args.seq_dropout, proj_dropout=args.proj_dropout).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     loss_history = []
     silhouette_history = []
+    epoch_metrics = []
+    best_sil = -999.0
+    best_epoch = -1
+    patience_counter = 0
     for epoch in range(args.epochs):
         model.train()
         total_loss = 0.0
@@ -177,6 +182,9 @@ def train(args):
 
             optimizer.zero_grad()
             loss.backward()
+            # gradient clipping
+            if args.grad_clip and args.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
 
             total_loss += loss.item()
@@ -215,13 +223,67 @@ def train(args):
 
                 km = KMeans(n_clusters=args.n_clusters, random_state=0)
                 lab = km.fit_predict(emb_red)
-                if len(set(lab)) > 1:
-                    sil = silhouette_score(emb_red, lab)
-                else:
-                    sil = float('nan')
-                silhouette_history.append(sil)
+                # repeat KMeans to get mean/std silhouette and cluster sizes
+                sils = []
+                cluster_sizes_runs = []
+                for r in range(args.silhouette_repeats):
+                    kmr = KMeans(n_clusters=args.n_clusters, random_state=r)
+                    labr = kmr.fit_predict(emb_red)
+                    if len(set(labr)) > 1:
+                        silr = silhouette_score(emb_red, labr)
+                    else:
+                        silr = float('nan')
+                    sils.append(silr)
+                    # cluster sizes
+                    counts = np.array([ (labr == k).sum() for k in range(args.n_clusters) ])
+                    cluster_sizes_runs.append(counts.tolist())
+
+                sil_mean = float(np.nanmean(sils))
+                sil_std = float(np.nanstd(sils))
+                silhouette_history.append(sil_mean)
                 np.save(os.path.join(args.out_dir, "silhouette_history.npy"), np.array(silhouette_history))
-                print(f"  silhouette (sample {sample_n}): {sil:.4f}")
+
+                # embedding variance per-dim and mean
+                emb_var = float(np.mean(np.std(emb_v, axis=0)))
+
+                # cluster sizes summary (mean and std across repeats)
+                cluster_sizes_arr = np.array(cluster_sizes_runs)
+                cluster_sizes_mean = cluster_sizes_arr.mean(axis=0).tolist()
+                cluster_sizes_std = cluster_sizes_arr.std(axis=0).tolist()
+
+                # record epoch metrics
+                em = {
+                    'epoch': epoch + 1,
+                    'silhouette_mean': sil_mean,
+                    'silhouette_std': sil_std,
+                    'cluster_sizes_mean': cluster_sizes_mean,
+                    'cluster_sizes_std': cluster_sizes_std,
+                    'embedding_var_mean': emb_var,
+                    'sample_n': int(sample_n),
+                    'avg_loss': float(avg_loss)
+                }
+                epoch_metrics.append(em)
+                # save metrics
+                with open(os.path.join(args.out_dir, 'epoch_metrics.jsonl'), 'a') as fh:
+                    fh.write(json.dumps(em) + "\n")
+
+                print(f"  silhouette (sample {sample_n}): mean={sil_mean:.4f} std={sil_std:.4f}")
+
+                # early stopping based on silhouette
+                if not np.isnan(sil_mean) and sil_mean > best_sil:
+                    best_sil = sil_mean
+                    best_epoch = epoch + 1
+                    patience_counter = 0
+                    # save best model
+                    torch.save(model.state_dict(), os.path.join(args.out_dir, 'best_model_by_silhouette.pt'))
+                    print(f"  -> New best silhouette {best_sil:.4f} (epoch {best_epoch}), model saved")
+                else:
+                    patience_counter += 1
+                    print(f"  patience {patience_counter}/{args.patience}")
+
+                if patience_counter >= args.patience:
+                    print(f"Early stopping triggered (no improvement in {args.patience} epochs)")
+                    break
 
         except Exception as e:
             print(f"Silhouette monitoring skipped due to error: {e}")
@@ -242,53 +304,91 @@ def train(args):
     all_emb = np.vstack(all_emb)
     os.makedirs(args.out_dir, exist_ok=True)
 
-    # clustering with KMeans (baseline)
-    kmeans = KMeans(n_clusters=args.n_clusters, random_state=0)
-    labels = kmeans.fit_predict(all_emb)
-    np.savetxt(os.path.join(args.out_dir, "cluster_labels_kmeans.csv"), labels, fmt="%d")
+    # save embeddings
+    np.save(os.path.join(args.out_dir, 'embeddings.npy'), all_emb)
+
+    # clustering with KMeans (baseline) repeated
+    sils_final = []
+    labels_runs = []
+    for r in range(args.cluster_repeats):
+        kmf = KMeans(n_clusters=args.n_clusters, random_state=r)
+        labf = kmf.fit_predict(all_emb)
+        labels_runs.append(labf)
+        if len(set(labf)) > 1:
+            sils_final.append(silhouette_score(all_emb, labf))
+        else:
+            sils_final.append(float('nan'))
+
+    sil_final_mean = float(np.nanmean(sils_final))
+    sil_final_std = float(np.nanstd(sils_final))
+    # save last labels and summary
+    np.savetxt(os.path.join(args.out_dir, "cluster_labels_kmeans.csv"), labels_runs[-1], fmt="%d")
+    with open(os.path.join(args.out_dir, 'kmeans_silhouette_summary.json'), 'w') as fh:
+        json.dump({'mean': sil_final_mean, 'std': sil_final_std, 'repeats': args.cluster_repeats}, fh)
 
     # t-SNE plot of KMeans clusters
     try:
         tsne = TSNE(n_components=2, random_state=0)
         proj = tsne.fit_transform(all_emb)
         plt.figure(figsize=(8, 6))
-        sc = plt.scatter(proj[:, 0], proj[:, 1], c=labels, cmap="tab10", s=6)
+        # use the last KMeans run labels for plotting
+        sc = plt.scatter(proj[:, 0], proj[:, 1], c=labels_runs[-1], cmap="tab10", s=6)
         plt.colorbar(sc, label="cluster")
         plt.title("KMeans clusters (t-SNE)")
         plt.tight_layout()
         plt.savefig(os.path.join(args.out_dir, "clusters_kmeans_tsne.png"), dpi=150)
         plt.close()
     except Exception:
+        import traceback
         print("t-SNE plot failed; skipping t-SNE visualization")
+        traceback.print_exc()
 
     # Try UMAP + HDBSCAN for density-based clustering (optional)
-    try:
-        import umap
-        import hdbscan
+    # Disabled due to missing packages; uncomment if umap-learn and hdbscan are installed
+    # try:
+    #     import umap
+    #     import hdbscan
+    #
+    #     print("Running UMAP + HDBSCAN...")
+    #     reducer = umap.UMAP(n_components=min(10, all_emb.shape[1]), random_state=0)
+    #     emb_umap = reducer.fit_transform(all_emb)
+    #
+    #     clusterer = hdbscan.HDBSCAN(min_cluster_size=args.hdb_min_cluster_size, min_samples=args.hdb_min_samples)
+    #     hdb_labels = clusterer.fit_predict(emb_umap)
+    #     np.savetxt(os.path.join(args.out_dir, "cluster_labels_hdbscan.csv"), hdb_labels, fmt="%d")
+    #
+    #     # 2D visualization (UMAP to 2D)
+    #     reducer2 = umap.UMAP(n_components=2, random_state=1)
+    #     emb2d = reducer2.fit_transform(all_emb)
+    #     plt.figure(figsize=(8, 6))
+    #     sc = plt.scatter(emb2d[:, 0], emb2d[:, 1], c=hdb_labels, cmap="tab10", s=6)
+    #     plt.colorbar(sc, label="hdbscan_cluster")
+    #     plt.title("HDBSCAN clusters (UMAP 2D)")
+    #     plt.tight_layout()
+    #     plt.savefig(os.path.join(args.out_dir, "clusters_hdbscan_umap.png"), dpi=150)
+    #     plt.close()
+    #     print(f"Saved HDBSCAN labels and UMAP plot to {args.out_dir}")
+    # except Exception as e:
+    #     print(f"UMAP+HDBSCAN skipped (missing packages or error): {e}")
 
-        print("Running UMAP + HDBSCAN...")
-        reducer = umap.UMAP(n_components=min(10, all_emb.shape[1]), random_state=0)
-        emb_umap = reducer.fit_transform(all_emb)
-
-        clusterer = hdbscan.HDBSCAN(min_cluster_size=args.hdb_min_cluster_size, min_samples=args.hdb_min_samples)
-        hdb_labels = clusterer.fit_predict(emb_umap)
-        np.savetxt(os.path.join(args.out_dir, "cluster_labels_hdbscan.csv"), hdb_labels, fmt="%d")
-
-        # 2D visualization (UMAP to 2D)
-        reducer2 = umap.UMAP(n_components=2, random_state=1)
-        emb2d = reducer2.fit_transform(all_emb)
-        plt.figure(figsize=(8, 6))
-        sc = plt.scatter(emb2d[:, 0], emb2d[:, 1], c=hdb_labels, cmap="tab10", s=6)
-        plt.colorbar(sc, label="hdbscan_cluster")
-        plt.title("HDBSCAN clusters (UMAP 2D)")
-        plt.tight_layout()
-        plt.savefig(os.path.join(args.out_dir, "clusters_hdbscan_umap.png"), dpi=150)
-        plt.close()
-        print(f"Saved HDBSCAN labels and UMAP plot to {args.out_dir}")
-    except Exception as e:
-        print(f"UMAP+HDBSCAN skipped (missing packages or error): {e}")
 
     print(f"Saved KMeans labels and plots to {args.out_dir}")
+
+    # plot loss + silhouette history
+    try:
+        plt.figure(figsize=(8, 4))
+        epochs = np.arange(1, len(loss_history) + 1)
+        plt.plot(epochs, loss_history, label='loss')
+        if len(silhouette_history) > 0:
+            plt.plot(epochs[: len(silhouette_history)], silhouette_history, label='silhouette')
+        plt.xlabel('epoch')
+        plt.legend()
+        plt.title('Loss and Silhouette over epochs')
+        plt.tight_layout()
+        plt.savefig(os.path.join(args.out_dir, 'loss_silhouette.png'))
+        plt.close()
+    except Exception:
+        pass
 
 
 def cli():
@@ -297,14 +397,21 @@ def cli():
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--temperature", type=float, default=0.5)
-    parser.add_argument("--embed_dim", type=int, default=128)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--embed_dim", type=int, default=256)
     parser.add_argument("--n_clusters", type=int, default=5)
     parser.add_argument("--val_split", type=float, default=0.2)
     parser.add_argument("--out_dir", type=str, default="outputs/unsup")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--augment", action="store_true", default=False, help="Enable data augmentations during contrastive training")
     parser.add_argument("--dropout", type=float, default=0.3, help="Token/entity dropout probability used when augmenting")
+    parser.add_argument("--patience", type=int, default=5, help="Early stopping patience (epochs) on silhouette")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Max norm for gradient clipping (0 to disable)")
+    parser.add_argument("--weight_decay", type=float, default=1e-4, help="Weight decay for optimizer")
+    parser.add_argument("--silhouette_repeats", type=int, default=5, help="Number of KMeans repeats for silhouette mean/std during validation")
+    parser.add_argument("--cluster_repeats", type=int, default=10, help="Number of KMeans repeats for final clustering stability")
+    parser.add_argument("--seq_dropout", type=float, default=0.1, help="Sequence input dropout in the encoder")
+    parser.add_argument("--proj_dropout", type=float, default=0.3, help="Projection head dropout in the encoder")
     parser.add_argument("--silhouette_sample", type=int, default=1000, help="Number of validation samples to compute silhouette per epoch (0 to disable)")
     parser.add_argument("--hdb_min_cluster_size", type=int, default=20)
     parser.add_argument("--hdb_min_samples", type=int, default=5)

@@ -15,8 +15,7 @@ class StrategyUnsupervisedEncoder(nn.Module):
     nearest-neighbour retrieval, etc.).
     """
 
-    def __init__(self, vocab_sizes, embedding_dim: int = 64, hidden_dim: int = 256, embed_out: int = 128,
-                 seq_dropout: float = 0.1, proj_dropout: float = 0.3):
+    def __init__(self, vocab_sizes, embedding_dim: int = 256, seq_dropout: float = 0.1, proj_dropout: float = 0.3,hidden_dim: int = 256, embed_out: int = 128):
         super(StrategyUnsupervisedEncoder, self).__init__()
 
         # Sequence embeddings
