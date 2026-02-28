@@ -1,5 +1,6 @@
 import torch
 from torch.utils.data import Dataset
+from dataset_prep_event_based import DataSetPrep
 
 class AoE4Dataset(Dataset):
     def __init__(self, X_seq, X_mask, X_meta, y):
@@ -21,6 +22,6 @@ class AoE4Dataset(Dataset):
 
 if __name__ == "__main__":
     # Test the dataset
-    dataset = AoE4Dataset('transformer_input_test_v2.csv', seq_len=50)
+    dataset = DataSetPrep('transformer_input_test_v4.csv')
     print(f"\n✓ Dataset created successfully!")
    

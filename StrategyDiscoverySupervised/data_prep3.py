@@ -325,7 +325,7 @@ def generate_event_based(build_order, meta_data, age_up_times, strat_label):
         age = get_age_from_data(age_up_times, time)
         
         if time > 900 or age == 'IMPERIAL':
-            break
+            continue
 
         villager_delta = 0
         for item in build_order:
@@ -337,8 +337,17 @@ def generate_event_based(build_order, meta_data, age_up_times, strat_label):
             elif item['event'] == 'DESTROY':
                 villager_delta -= 1
 
+        if bo['event'] == 'DESTROY':
+            continue
+
         data_row.append( meta_data | bo | { 'age': age, 'villagers': villager_delta, 'strat': strat_label })
     return data_row
+
+def resolve_entity_mapping(entity, type):
+    if type == 'Unit' and 'Villager' in entity:
+        return 'Villager'
+    return entity
+
 
 
 def extract_events_from_obj(obj: dict):
@@ -448,7 +457,8 @@ def extract_events_from_obj(obj: dict):
             icon = item.get('icon') or ''
             entity = _clean_entity_from_icon(icon)
 
-            for key, name in (('constructed', 'BUILD'), ('finished', 'FINISH'), ('destroyed', 'DESTROY'), ('constructed', 'CONSTRUCT')):
+            entity = resolve_entity_mapping(entity, item.get('type'))
+            for key, name in (('constructed', 'BUILD'), ('finished', 'FINISH'), ('constructed', 'CONSTRUCT'), ('destroyed', 'DESTROY')):
                 for t in item.get(key) or []:
                     events.append({
                         'event': name,
@@ -457,8 +467,20 @@ def extract_events_from_obj(obj: dict):
                         'time': t,
                     })
 
-        
+        events = sorted(events, key=lambda x: x['time'] or 0)
         age_up_times = get_age_up_times(player.get('actions') or {})
+        if age_up_times is None:
+            print("[WARN] no age up times found")
+            continue
+        if age_up_times.get('FEUDAL') is None:
+            print("[WARN] no FEUDAL age up times found")
+            continue
+            print(f"[DEBUG] Game {game_id} - Player {profile_id} - Age up times: {age_up_times}")
+
+        # if player_civ != 'macedonian_dynasty':
+        #     print(f"[INFO] Skipping non-Macedonian game_id={game_id}, profile_id={profile_id}, civ={player_civ}")
+        #     continue
+
         strat_label = calculate_strat_from_data(events, resource_snapshot, age_up_times)
         if strat_label == 'unknown':
             print(f"[INFO] Skipping unknown strat for game_id={game_id}, profile_id={profile_id}")
@@ -535,14 +557,9 @@ def prepare_transformer_csv(files, out_csv: str) -> None:
 
 def main():
     p = argparse.ArgumentParser(description="Compute per-civilization winrates from collected .jsonl game records.")
+    # p.add_argument("paths", nargs="*", default= ["./StrategyDiscoverySupervised/*.jsonl"], help="Path(s) or glob(s) to .jsonl files. If omitted, all *.jsonl in CWD are used.")
     p.add_argument("paths", nargs="*", help="Path(s) or glob(s) to .jsonl files. If omitted, all *.jsonl in CWD are used.")
-    p.add_argument("--winrate-heatmap", dest="winrate_heatmap", default="h2h_heatmap.png",
-                   help="Write winrate heatmap PNG (default: h2h_heatmap.png). Use empty string to skip.")
-    p.add_argument("--games-heatmap", dest="games_heatmap", default="h2h_games_heatmap.png",
-                   help="Write games-count heatmap PNG (default: h2h_games_heatmap.png). Use empty string to skip.")
-    p.add_argument("--min-games", dest="min_games", type=int, default=10,
-                   help="Minimum games threshold to highlight cells in games heatmap (default: 10).")
-    p.add_argument("--export-events", dest="export_events", default="transformer_input_test_v2.csv",
+    p.add_argument("--export-events", dest="export_events", default="transformer_input_test_v4.csv",
                    help="Write transformer-ready events CSV to given path (e.g. events.csv). If empty, no events file is written.")
     args = p.parse_args()
 

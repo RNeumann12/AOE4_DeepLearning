@@ -82,6 +82,8 @@ class DataSetPrep(Dataset):
         labels = []
         masks = []
         metadata = []
+        game_ids = []
+        player_ids = []
 
         # build sequences for event data, build metadata and label
         for (game_id, profile_id), group in grouped:
@@ -109,6 +111,8 @@ class DataSetPrep(Dataset):
                 'map': map_vocab[group.iloc[0]['map']]
             }
             metadata.append(meta)
+            game_ids.append(game_id)
+            player_ids.append(profile_id)
             
             # Label
             labels.append(label_vocab[group.iloc[0]['strat']])
@@ -141,6 +145,8 @@ class DataSetPrep(Dataset):
                 X_mask=X_mask, 
                 X_meta=X_meta, 
                 y=y,
+                game_ids=np.array(game_ids),
+                player_ids=np.array(player_ids),
                 entity_vocab=entity_vocab,
                 event_vocab=event_vocab,
                 type_vocab=type_vocab,

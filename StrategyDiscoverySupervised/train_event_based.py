@@ -21,18 +21,22 @@ import wandb
 
 BATCH_SIZE = 32
 TEST_SIZE = 0.2
-NUM_EPOCHS = 50
-LR = 0.0001
+NUM_EPOCHS = 15
+LR = 0.001
 PATIENCE = 5
-CLASS_WEIGHT_METHODE = 'sqr'
-WEIGHT_DECAY = 0.01
+WEIGHT_DECAY = 0.001
+OPTIMIZER = 'adamw'
+USE_SCHEDULER = False
+MOMENTUM = None
 
-def train_epoch(model, dataloader, criterion, optimizer, device):
+def train_epoch(model, dataloader, criterion, optimizer, class_weights, device):
     model.train()
     train_loss = 0
     train_correct = 0
     train_total = 0
     
+    all_predictions = []
+    all_labels = []
     pbar = tqdm(dataloader, desc="Epoch {epoch}Training", leave=False)
     for batch in pbar:
         sequence = batch['sequence'].to(device)
@@ -50,14 +54,19 @@ def train_epoch(model, dataloader, criterion, optimizer, device):
         _, predicted = outputs.max(1)
         train_total += labels.size(0)
         train_correct += predicted.eq(labels).sum().item()
+
+        all_predictions.extend(predicted.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
     
-    train_acc = 100. * train_correct / train_total
+    train_acc = 100. * train_correct / train_total 
+    weighted_acc = np.sum([class_weights[y]* (y == y_hat) for y, y_hat in zip(all_labels, all_predictions)]) / np.sum([class_weights[y] for y in all_labels])
+    
     avg_train_loss = train_loss / len(dataloader)
 
-    return train_acc, avg_train_loss
+    return weighted_acc, avg_train_loss
 
 @torch.no_grad()
-def eval_epoch(model, dataloader, criterion, device):
+def eval_epoch(model, dataloader, criterion, class_weights, device):
     model.eval()
     val_loss = 0
     val_correct = 0
@@ -102,6 +111,8 @@ def eval_epoch(model, dataloader, criterion, device):
                         'confidence': confidences[i].item(),
                         'all_probs': probs[i].cpu().numpy()
                     })
+    
+    weighted_acc = np.sum([class_weights[y]* (y == y_hat) for y, y_hat in zip(all_labels, all_predictions)]) / np.sum([class_weights[y] for y in all_labels])
     
     val_acc = 100. * val_correct / val_total
     avg_val_loss = val_loss / len(dataloader)
@@ -154,6 +165,7 @@ def eval_epoch(model, dataloader, criterion, device):
     
     metrics = {
         'accuracy': val_acc,
+        'weighted_accuracy': weighted_acc,
         'loss': avg_val_loss,
         'precision_macro': precision_macro,
         'recall_macro': recall_macro,
@@ -172,6 +184,7 @@ def log_metrics_to_wandb(metrics, label_names, epoch, phase='val'):
     # Collect all metrics in one dict
     log_dict = {
         f"{phase}/accuracy": metrics['accuracy'],
+        f"{phase}/weighted_accuracy": metrics['weighted_accuracy'],
         f"{phase}/loss": metrics['loss'],
         f"{phase}/precision_macro": metrics['precision_macro'],
         f"{phase}/recall_macro": metrics['recall_macro'],
@@ -225,6 +238,14 @@ def log_metrics_to_wandb(metrics, label_names, epoch, phase='val'):
 
     return log_dict
 
+def print_label_distribution(y, name="Dataset"):
+    unique_classes, counts = np.unique(y, return_counts=True)
+    total = len(y)
+    print(f"{name} label distribution:")
+    for cls, count in zip(unique_classes, counts):
+        print(f"Class {cls:<3}: {count:>5} ({count/total*100:5.2f}%)")
+
+
 def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     
@@ -239,7 +260,10 @@ def main():
             "epochs": NUM_EPOCHS,
             "lr": LR,
             "patience": PATIENCE,
-            "weight_decay": WEIGHT_DECAY
+            "weight_decay": WEIGHT_DECAY,
+            "optimizer": OPTIMIZER,
+            "use_scheduler": USE_SCHEDULER,
+            "momentum": MOMENTUM,
         }
     )
 
@@ -264,7 +288,7 @@ def main():
 
     # Train/val split
     X_seq_train, X_seq_val, X_mask_train, X_mask_val, X_meta_train, X_meta_val, y_train, y_val = train_test_split(
-        X_seq, X_mask, X_meta, y, test_size=TEST_SIZE, random_state=42
+        X_seq, X_mask, X_meta, y, test_size=TEST_SIZE, random_state=42, stratify=y        
     )
 
     idx_to_strat = {v: k for k, v in label_vocab.items()}
@@ -275,15 +299,9 @@ def main():
         percentage = (count / len(y)) * 100
         print(f"{class_name:<30} {class_id:<12} {count:<12} {percentage:>10.1f}%")
 
-    if CLASS_WEIGHT_METHODE == 'inverse':
-        weights  = 1 / class_counts
-    elif CLASS_WEIGHT_METHODE == 'sqr':
-        weights = 1.0 / class_counts ** 0.25 #np.sqrt(class_counts)
-    weights = weights / weights.sum() * len(weights)
-    print(f"Class weights: {weights}")
-    class_weights = torch.FloatTensor(weights).to(device)
-
-    print(f"\nClass weights for loss function:")
+    # class_weights = torch.FloatTensor(weights).to(device)
+    class_weights = {cls: 1/count for cls, count in zip(unique_classes, class_counts)}
+    print(f"\nClass weights for accuracy calculation:")
     print(f"{'Strategy Name':<30} {'Weight':<15}")
     print("=" * 45)
     for class_id in range(len(label_vocab)):
@@ -294,9 +312,11 @@ def main():
     train_dataset = AoE4Dataset(X_seq_train, X_mask_train, X_meta_train, y_train)
     val_dataset = AoE4Dataset(X_seq_val, X_mask_val, X_meta_val, y_val)
 
-    print(f"Training samples: {len(train_dataset)}")
-    print(f"Validation samples: {len(val_dataset)}")
+    print(f"\nTraining samples: {len(train_dataset)}")
+    print_label_distribution(y_train, "Train")
 
+    print(f"\nValidation samples: {len(val_dataset)}")
+    print_label_distribution(y_val, "Validation")
 
     # sampler = WeightedRandomSampler(class_weights , num_samples=len(class_weights ), replacement=True)
     train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
@@ -317,23 +337,32 @@ def main():
     model = StrategyGRU(vocab_sizes, num_classes=len(label_vocab)).to(device)
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
-    
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=PATIENCE)
+
+    patience = PATIENCE
+    optimizer = None
+    scheduler = None
+
+    if OPTIMIZER == 'adamw':
+        optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    elif OPTIMIZER == 'sgd':
+        # optimizer = optim.SGD(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY, momentum=MOMENTUM)
+        optimizer = optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM)
+        if USE_SCHEDULER:
+            scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=PATIENCE)
 
     # Training settings
-    best_val_acc = 0
+    best_val_acc = -1
     patience_counter = 0
 
     # Training loop
     for epoch in range(NUM_EPOCHS):
         # Train
-        train_acc, avg_train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+        train_acc, avg_train_loss = train_epoch(model, train_loader, criterion, optimizer, class_weights, device)
     
         # Validation
-        val_metrics = eval_epoch(model, val_loader, criterion, device)
+        val_metrics = eval_epoch(model, val_loader, criterion, class_weights, device)
         val_loss = val_metrics['loss']
-        val_acc = val_metrics['accuracy']
+        val_acc = val_metrics['weighted_accuracy']
             
         print(f'Epoch {epoch+1}/{NUM_EPOCHS}:')
         print(f' Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.2f}%')
@@ -341,8 +370,6 @@ def main():
 
         # Log to wandb
         log_dict = log_metrics_to_wandb(val_metrics, label_names, epoch, phase='val')
-        scheduler.step(val_loss)
- 
         wandb.log(log_dict | {
             "Train Loss": avg_train_loss,
             "Train Accuracy": train_acc,
@@ -352,10 +379,33 @@ def main():
         }, step=epoch)
 
         # Save best model
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
-            torch.save(model.state_dict(), 'best_strat_disc_event_based.pt')
-            print(f'  → Model saved! (Val Acc: {val_acc:.2f}%)')
+        
+        
+        if scheduler is None:
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = model.state_dict()
+                torch.save(best_model_state, 'best_strat_disc_event_based.pt')
+                print(f'  → Model saved! (Val Acc: {val_acc:.2f}%)')
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                print(f"  ✗ No improvement. Patience: {patience_counter}/{patience}")
+                
+                if patience_counter >= patience:
+                    print(f"\n🛑 Early stopping triggered at epoch {epoch}")
+                    print(f"Best validation accuracy was: {best_val_acc:.4f}")
+                    model.load_state_dict(best_model_state)
+                    break
+        else: 
+            scheduler.step(val_loss)
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = model.state_dict()
+                torch.save(best_model_state, 'best_strat_disc_event_based.pt')
+                print(f'  → Model saved! (Val Acc: {val_acc:.2f}%)')
+
+        
             # patience_counter = 0
         # else:
         #     patience_counter += 1
