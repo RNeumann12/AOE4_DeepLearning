@@ -12,7 +12,7 @@ Usage:
 """
 import csv
 from collections import defaultdict, Counter
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Sequence
 import pandas as pd
 import torch
 from torch.utils.data import Dataset
@@ -22,7 +22,9 @@ PAD_TOKEN = "<PAD>"
 UNK_TOKEN = "<UNK>"
 
 
-def build_vocabs(df: pd.DataFrame, min_freq: int = 1) -> Dict[str, Dict[str, int]]:
+def build_vocabs(df: pd.DataFrame, min_freq: int = 1, 
+                 filter_events: Optional[List[str]] = None,
+                 filter_entities: Optional[List[str]] = None) -> Dict[str, Dict[str, int]]:
    
     """
     Builds three vocabularies for "entity", "event" and "civ" columns in the given DataFrame.
@@ -34,8 +36,34 @@ def build_vocabs(df: pd.DataFrame, min_freq: int = 1) -> Dict[str, Dict[str, int
 
     :param df: A DataFrame containing the columns 'entity', 'event', 'player_civ', and 'enemy_civ'.
     :param min_freq: The minimum frequency of a token to be included in the vocabularies.
+    :param filter_events: List of event types to EXCLUDE (e.g., ['DESTROY']).
+    :param filter_entities: List of entity names to EXCLUDE (e.g., ['Sheep']).
     :return: A dictionary containing the built vocabularies.
     """
+    # Apply filtering before building vocabularies
+    original_len = len(df)
+    
+    # Filter out unwanted events (e.g., DESTROY)
+    if filter_events:
+        df = df[~df['event'].isin(filter_events)]
+        filtered_len = len(df)
+        print(f"Vocabularies: Filtered out events {filter_events}: {original_len - filtered_len} rows excluded")
+    
+    # Filter out unwanted entities (e.g., Sheep - captured, not built)
+    if filter_entities:
+        pre_filter_len = len(df)
+        df = df[~df['entity'].astype(str).isin(filter_entities)]
+        filtered_len = len(df)
+        print(f"Vocabularies: Filtered out entities {filter_entities}: {pre_filter_len - filtered_len} rows excluded")
+    
+    # Filter out events at timestamp 0 (outside player control - starting units, etc.)
+    if 'time' in df.columns:
+        pre_filter_len = len(df)
+        df = df[df['time'] != 0]
+        filtered_len = len(df)
+        if pre_filter_len - filtered_len > 0:
+            print(f"Vocabularies: Filtered out timestamp=0 events: {pre_filter_len - filtered_len} rows excluded")
+    
     entity_counts = Counter(df['entity'].astype(str).tolist())
     event_counts = Counter(df['event'].astype(str).tolist())
     civ_counts = Counter(df['player_civ'].astype(str).tolist() + df['enemy_civ'].astype(str).tolist())
@@ -69,7 +97,8 @@ class AoEEventDataset(Dataset):
     Each item corresponds to a single player's event sequence in a game, with label in `player_won`.
     """
 
-    def __init__(self, csv_path: str, entity_vocab: Dict[str, int], event_vocab: Dict[str, int], civ_vocab: Dict[str, int], map_vocab: Dict[str, int], max_len: Optional[int] = None, use_time_features: bool = True, truncation_strategy: str = 'head_tail'):
+    def __init__(self, csv_path: str, entity_vocab: Dict[str, int], event_vocab: Dict[str, int], civ_vocab: Dict[str, int], map_vocab: Dict[str, int], max_len: Optional[int] = None, use_time_features: bool = True, truncation_strategy: str = 'head_tail',
+                 filter_events: Optional[List[str]] = None, filter_entities: Optional[List[str]] = None):
         """
         Initialize the dataset from a CSV file containing event sequences per player-game.
 
@@ -84,8 +113,35 @@ class AoEEventDataset(Dataset):
         :param use_time_features: If True, use delta time scaled as a feature.
         :param truncation_strategy: One of {'head', 'tail', 'head_tail'} determining how to
                                     truncate sequences when they exceed `max_len`.
+        :param filter_events: List of event types to EXCLUDE (e.g., ['DESTROY']).
+        :param filter_entities: List of entity names to EXCLUDE (e.g., ['Sheep']).
         """
         self.df = pd.read_csv(csv_path)
+        
+        # Apply filtering
+        original_len = len(self.df)
+        
+        # Filter out unwanted events (e.g., DESTROY)
+        if filter_events:
+            self.df = self.df[~self.df['event'].isin(filter_events)]
+            filtered_len = len(self.df)
+            print(f"Dataset: Filtered out events {filter_events}: {original_len - filtered_len} rows removed ({100*(original_len-filtered_len)/original_len:.1f}%)")
+        
+        # Filter out unwanted entities (e.g., Sheep - captured, not built)
+        if filter_entities:
+            pre_filter_len = len(self.df)
+            self.df = self.df[~self.df['entity'].astype(str).isin(filter_entities)]
+            filtered_len = len(self.df)
+            print(f"Dataset: Filtered out entities {filter_entities}: {pre_filter_len - filtered_len} rows removed ({100*(pre_filter_len-filtered_len)/pre_filter_len:.1f}%)")
+        
+        # Filter out events at timestamp 0 (outside player control - starting units, etc.)
+        if 'time' in self.df.columns:
+            pre_filter_len = len(self.df)
+            self.df = self.df[self.df['time'] != 0]
+            filtered_len = len(self.df)
+            if pre_filter_len - filtered_len > 0:
+                print(f"Dataset: Filtered out timestamp=0 events: {pre_filter_len - filtered_len} rows removed ({100*(pre_filter_len-filtered_len)/pre_filter_len:.1f}%)")
+        
         self.max_len = max_len
         self.entity_vocab = entity_vocab
         self.event_vocab = event_vocab

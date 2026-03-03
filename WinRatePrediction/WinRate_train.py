@@ -426,7 +426,7 @@ if __name__ == '__main__':
     parser.add_argument('--use_wandb', dest='use_wandb', action='store_true', default=True, help='Enable Weights & Biases logging (default: True)')
     parser.add_argument('--no-wandb', dest='use_wandb', action='store_false', help='Disable Weights & Biases logging')
     parser.add_argument('--wandb_entity', type=str, default='rineumann-universit-t-klagenfurt', help='W&B entity')
-    parser.add_argument('--wandb_project', type=str, default='DeepLearning-WinRate', help='W&B project')
+    parser.add_argument('--wandb_project', type=str, default='Win_Rate_Prediction', help='W&B project')
     parser.add_argument('--wandb_epochs', type=int, default=None, help='Override epochs in W&B config')
     parser.add_argument('--wandb_learning_rate', type=float, default=None, help='Override learning rate in W&B config')
     parser.add_argument('--filter_destroy_events', action='store_true', default=False, help='Filter out all DESTROY events from training data')

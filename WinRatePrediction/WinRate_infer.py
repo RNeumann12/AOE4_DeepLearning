@@ -2,20 +2,16 @@
 Inference script: load saved model and run on dataset, printing / saving predictions.
 
 Usage examples:
-  python  WinRatePrediction/WinRate_infer.py  --model best_model.pt --csv transformer_input.csv --out preds.csv
-  python WinRatePrediction/WinRate_infer.py --model best_model_len_50.pt --csv transformer_input_new.csv --max_len 30
-  python WinRatePrediction/WinRate_infer.py --model best_model.pt --csv transformer_input.csv --sweep_lengths --max_len 100 --length_step 5
+Standard inference over games to predict if player will win:
+    python WinRatePrediction/WinRate_infer.py --model best_model_len_200_no_destroy.pt --csv transformer_input_new.csv --max_len 200 --filter_destroy_events  --print_game_table
 
 Sweep over sequence lengths to analyze accuracy vs length:
-python WinRatePrediction/WinRate_infer.py --model best_model.pt --csv transformer_input.csv --sweep_lengths --max_len 100 --length_step 5
-python WinRatePrediction/WinRate_infer.py --model best_model_len_50.pt --csv transformer_input.csv --sweep_lengths --max_len 50 --length_step 5
-python WinRatePrediction/WinRate_infer.py --model best_model_len_50_no_destroy.pt --csv transformer_input.csv --sweep_lengths --max_len 50 --length_step 5
+    python WinRatePrediction/WinRate_infer.py --model best_model_len_200_no_destroy.pt --csv transformer_input_new.csv --sweep_lengths --max_len 200 --length_step 50 --filter_destroy_events
 
-python WinRatePrediction/WinRate_infer.py --model best_model_len_50_no_destroy.pt --csv transformer_input_new.csv --sweep_lengths --max_len 50 --length_step 5 --filter_destroy_events  
-python WinRatePrediction/WinRate_infer.py --model best_model_len_200_no_destroy.pt --csv transformer_input_new.csv --sweep_lengths --max_len 200 --length_step 20 --filter_destroy_events
+Validation on dataset:
+  python WinRatePrediction/WinRate_infer.py --model WinRatePrediction/winrate_final_model.pt --csv training_data_2026_01.csv --max_len 100 --filter_destroy_events
 
-
-  """
+   """
 import argparse
 import tempfile
 import torch
@@ -166,41 +162,31 @@ def run_inference_for_length(model, vocabs, csv_path, max_len, truncation_strate
     return preds, trues
 
 
-def sweep_lengths_and_plot(args, model, vocabs, device):
-    """Sweep through different max_len values and plot accuracy."""
+def sweep_lengths_and_plot(args, model, vocabs, device, csv_path):
+    """Sweep through different max_len values and plot accuracy vs sequence length.
+
+    Requires real win/loss labels — call only when has_labels is True.
+    The csv_path should already be preprocessed (filtered, dummy labels injected if needed)
+    by the caller.
+    """
     # Determine the maximum length to sweep to
-    df = pd.read_csv(args.csv)
-    
-    # Optionally filter out DESTROY events
-    if args.filter_destroy_events:
-        original_len = len(df)
-        df = df[df['event'] != 'DESTROY']
-        print(f"Filtered out DESTROY events: {original_len} -> {len(df)} rows ({original_len - len(df)} removed)")
-    
+    df = pd.read_csv(csv_path)
     grouped = df.groupby(['game_id', 'profile_id']).size()
     dataset_longest = int(grouped.max()) if len(grouped) > 0 else 0
-    
+
     if args.max_len is not None:
         sweep_max = args.max_len
     else:
         sweep_max = min(dataset_longest, args.max_pos_embed_cap)
-    
+
     # Generate length values to test (from length_step to sweep_max, in increments of length_step)
     lengths = list(range(args.length_step, sweep_max + 1, args.length_step))
     if lengths and lengths[-1] != sweep_max:
         lengths.append(sweep_max)
-    
+
     print(f"\n{'='*60}")
     print(f"SWEEPING SEQUENCE LENGTHS: {args.length_step} to {sweep_max} (step={args.length_step})")
     print(f"{'='*60}\n")
-    
-    # If filtering, save to temp file for dataset loading
-    if args.filter_destroy_events:
-        temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
-        df.to_csv(temp_csv.name, index=False)
-        csv_path = temp_csv.name
-    else:
-        csv_path = args.csv
     
     results = {
         'length': [],
@@ -326,14 +312,9 @@ def sweep_lengths_and_plot(args, model, vocabs, device):
     results_df.to_csv(csv_out, index=False)
     print(f"Results CSV saved to: {csv_out}")
     print(f"{'='*60}\n")
-    
-    # Clean up temp file if created
-    if args.filter_destroy_events:
-        import os
-        os.unlink(csv_path)
-    
+
     plt.show()
-    
+
     return results
 
 
@@ -357,22 +338,48 @@ def main(args):
     model.to(device)
     model.eval()
 
-    # If sweep mode is enabled, run the length sweep analysis
-    if args.sweep_lengths:
-        sweep_lengths_and_plot(args, model, vocabs, device)
-        return
-
-    # Standard inference mode
-    # Determine longest sequence and apply optional safety cap
+    # ------------------------------------------------------------------ #
+    # Load and preprocess CSV (shared by both sweep and standard modes)   #
+    # ------------------------------------------------------------------ #
     df = pd.read_csv(args.csv)
-    
+
     # Optionally filter out DESTROY events
     if args.filter_destroy_events:
         original_len = len(df)
         df = df[df['event'] != 'DESTROY']
         print(f"Filtered out DESTROY events: {original_len} -> {len(df)} rows ({original_len - len(df)} removed)")
-    
-    grouped = df.groupby(['game_id','profile_id']).size()
+
+    # Detect whether real win/loss labels are available
+    has_labels = 'player_won' in df.columns and df['player_won'].notna().any()
+    if not has_labels:
+        print("Note: 'player_won' column not found or empty — running in inference-only mode (metrics skipped).")
+        df['player_won'] = 0  # dummy so AoEEventDataset doesn't crash
+
+    # Write a temp CSV whenever the dataframe was modified (filtered or dummy label added)
+    needs_temp = args.filter_destroy_events or not has_labels
+    if needs_temp:
+        temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
+        df.to_csv(temp_csv.name, index=False)
+        csv_path = temp_csv.name
+    else:
+        csv_path = args.csv
+
+    # If sweep mode is enabled, run the length sweep analysis (requires labels)
+    if args.sweep_lengths:
+        if not has_labels:
+            print("Error: --sweep_lengths requires 'player_won' labels in the CSV (validation mode only).")
+            if needs_temp:
+                os.unlink(csv_path)
+            return
+        sweep_lengths_and_plot(args, model, vocabs, device, csv_path=csv_path)
+        if needs_temp:
+            os.unlink(csv_path)
+        return
+
+    # ------------------------------------------------------------------ #
+    # Standard inference / validation pass                                #
+    # ------------------------------------------------------------------ #
+    grouped = df.groupby(['game_id', 'profile_id']).size()
     dataset_longest = int(grouped.max()) if len(grouped) > 0 else 0
     if args.max_len is not None:
         desired_max_len = args.max_len
@@ -381,14 +388,6 @@ def main(args):
         if dataset_longest > desired_max_len:
             print(f"Warning: longest sequence in data is {dataset_longest}, capping positional length to {desired_max_len}. Sequences will be truncated per strategy '{args.truncation_strategy}'")
 
-    # If filtering, save to temp file for dataset loading
-    if args.filter_destroy_events:
-        temp_csv = tempfile.NamedTemporaryFile(mode='w', suffix='.csv', delete=False)
-        df.to_csv(temp_csv.name, index=False)
-        csv_path = temp_csv.name
-    else:
-        csv_path = args.csv
-
     ds = AoEEventDataset(csv_path, vocabs['entity_vocab'], vocabs['event_vocab'], vocabs['civ_vocab'], vocabs['map_vocab'], max_len=desired_max_len, truncation_strategy=args.truncation_strategy)
     loader = DataLoader(ds, batch_size=args.batch_size, collate_fn=collate_fn)
 
@@ -396,7 +395,6 @@ def main(args):
     trues = []
     with torch.no_grad():
         for batch in loader:
-            # move tensors to device
             for k, v in batch.items():
                 if isinstance(v, torch.Tensor):
                     batch[k] = v.to(device)
@@ -414,20 +412,45 @@ def main(args):
             preds.extend(list(probs.cpu().numpy()))
             trues.extend(list(batch['labels'].cpu().numpy()))
 
-    # print basic stats
+    # Print basic stats
     print(f'Predictions: mean={np.mean(preds):.4f}, min={np.min(preds):.4f}, max={np.max(preds):.4f}')
 
-    # Compute and print metrics
-    metrics = compute_metrics(preds, trues)
+    # Per-game probability table
+    if args.print_game_table:
+        rows = []
+        for i, ex in enumerate(ds.examples):
+            row = {
+                'game_id':    ex['game_id'],
+                'player_civ': ex['player_civ'],
+                'enemy_civ':  ex['enemy_civ'],
+                'map':        ex['map'],
+                'win_prob':   round(float(preds[i]), 4),
+            }
+            if has_labels:
+                row['actual_win'] = int(trues[i])
+                row['correct'] = 'Y' if (preds[i] >= 0.5) == bool(trues[i]) else 'N'
+            rows.append(row)
+        game_df = pd.DataFrame(rows)
+        print(f"\n{'='*80}")
+        print(f"PER-GAME WIN PROBABILITY TABLE  (model={args.model}, max_len={desired_max_len}, truncation={args.truncation_strategy})")
+        print(f"{'='*80}")
+        print(game_df.to_string(index=False))
+        print(f"{'='*80}\n")
+
+    # Compute and print validation metrics (only when labels are available)
+    if has_labels:
+        compute_metrics(preds, trues)
 
     # Clean up temp file if created
-    if args.filter_destroy_events:
-        import os
+    if needs_temp:
         os.unlink(csv_path)
 
-    # Optionally save
+    # Optionally save predictions
     if args.out:
-        pd.DataFrame({'pred': preds, 'true': trues}).to_csv(args.out, index=False)
+        out_df = pd.DataFrame({'pred': preds})
+        if has_labels:
+            out_df['true'] = trues
+        out_df.to_csv(args.out, index=False)
         print(f'Saved predictions to {args.out}')
 
 
@@ -450,5 +473,6 @@ if __name__ == '__main__':
     parser.add_argument('--length_step', type=int, default=5, help='Step size for length sweep (default: 5)')
     parser.add_argument('--sweep_plot_out', type=str, default='length_sweep_results.png', help='Output path for the length sweep plot')
     parser.add_argument('--filter_destroy_events', action='store_true', default=False, help='Filter out all DESTROY events from inference data')
+    parser.add_argument('--print_game_table', action='store_true', default=False, help='Print a table showing win probability for every game (with model parameters)')
     args = parser.parse_args()
     main(args)

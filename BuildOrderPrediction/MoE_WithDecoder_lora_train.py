@@ -4,7 +4,7 @@ LoRA fine-tuning for the MoE WithDecoder SequencePredictor.
 
 Freezes the base model and trains only small rank-decomposed adapter matrices
 inserted into target linear layers. This lets the model adapt to a new balance
-patch using 200-1500 games in 10-20 epochs instead of full retraining.
+patch using 200-1500 games in 20-30 epochs instead of full retraining.
 
 Example usage:
     python BuildOrderPrediction/MoE_WithDecoder_lora_train.py \

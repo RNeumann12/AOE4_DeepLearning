@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-collect_aoe4_games_with_summary_v2.py
+data_miner.py
 
 More robust collector for AoE4World:
 - Attempts API leaderboard fetch; if that returns empty / unexpected, falls back to scraping the public leaderboard page.
@@ -11,7 +11,7 @@ Requires:
     pip install requests beautifulsoup4
 
 Usage:
-    python collect_aoe4_games_with_summary_v2.py
+    python DataPreperation/data_miner.py
 """
 import requests
 import time
@@ -31,7 +31,7 @@ MAX_LEADERBOARD_PAGES = 30
 
 min_rating = 1700
 num_players_to_collect = 200
-games_per_player = 20
+games_per_player = 50 # was 20
 
 OUTFILE = f"collected_games_with_summary_v2_{time.strftime('%Y-%m-%d')}.jsonl"
 

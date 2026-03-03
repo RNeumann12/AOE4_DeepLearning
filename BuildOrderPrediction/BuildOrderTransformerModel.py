@@ -1,9 +1,97 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from typing import Tuple, List, Optional
 
 from WinRatePrediction.WinRateTransformerModel import AoETransformer, TimePositionalEncoding
+
+
+class FocalLoss(nn.Module):
+    """
+    Focal Loss for addressing class imbalance.
+    FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)
+    
+    This helps the model focus on hard examples (rare entities like military units)
+    instead of easy examples (common entities like Villagers).
+    """
+    def __init__(self, alpha: Optional[torch.Tensor] = None, gamma: float = 2.0, 
+                 reduction: str = 'mean', ignore_index: int = 0, 
+                 label_smoothing: float = 0.0):
+        super().__init__()
+        self.alpha = alpha  # Class weights
+        self.gamma = gamma  # Focusing parameter (higher = more focus on hard examples)
+        self.reduction = reduction
+        self.ignore_index = ignore_index
+        self.label_smoothing = label_smoothing
+
+    def forward(self, input: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            input: (B, C) or (B, L, C) logits
+            target: (B,) or (B, L) indices
+        """
+        # Flatten if 3D (sequence model output)
+        if input.ndim > 2:
+            c = input.shape[-1]
+            input = input.reshape(-1, c)
+            target = target.reshape(-1)
+
+        # Cast to float32 for numerical stability
+        input = input.float()
+        
+        # Create mask for valid (non-ignored) indices
+        valid_mask = target != self.ignore_index
+        
+        if valid_mask.sum() == 0:
+            return torch.tensor(0.0, device=input.device, requires_grad=True)
+        
+        # Filter to valid indices only
+        input_valid = input[valid_mask]
+        target_valid = target[valid_mask]
+        
+        # Apply label smoothing if specified
+        num_classes = input_valid.size(-1)
+        if self.label_smoothing > 0:
+            # Create smoothed target distribution
+            smooth_target = torch.zeros_like(input_valid)
+            smooth_target.fill_(self.label_smoothing / (num_classes - 1))
+            smooth_target.scatter_(1, target_valid.unsqueeze(1), 1.0 - self.label_smoothing)
+            
+            # Compute log probabilities
+            log_probs = F.log_softmax(input_valid, dim=-1)
+            probs = torch.exp(log_probs)
+            
+            # For focal loss modulation, use the probability of the true class
+            pt = probs.gather(1, target_valid.unsqueeze(1)).squeeze(1)
+            
+            # Compute smoothed cross entropy
+            ce_loss = -(smooth_target * log_probs).sum(dim=-1)
+        else:
+            # Standard cross entropy
+            log_probs = F.log_softmax(input_valid, dim=-1)
+            probs = torch.exp(log_probs)
+            pt = probs.gather(1, target_valid.unsqueeze(1)).squeeze(1)
+            ce_loss = F.nll_loss(log_probs, target_valid, reduction='none')
+        
+        # Focal modulation: (1 - pt)^gamma
+        focal_weight = (1 - pt) ** self.gamma
+        
+        # Apply alpha (class weights) if provided
+        if self.alpha is not None:
+            alpha = self.alpha.to(input.device)
+            alpha_t = alpha[target_valid]
+            focal_loss = alpha_t * focal_weight * ce_loss
+        else:
+            focal_loss = focal_weight * ce_loss
+        
+        # Reduction
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 class BuildOrderGenerator(nn.Module):
     """
@@ -144,6 +232,15 @@ class BuildOrderGenerator(nn.Module):
         # Register as buffer so it moves to device with the model
         self.register_buffer('civ_entity_mask', mask.bool())
     
+    def _top_k_filter(self, logits: torch.Tensor, k: int) -> torch.Tensor:
+        """Filter logits to keep only top-k values, setting others to -inf."""
+        if k <= 0:
+            return logits
+        # logits shape: (B, 1, V) or (B, V)
+        values, _ = torch.topk(logits, min(k, logits.size(-1)), dim=-1)
+        min_value = values[..., -1:]
+        return torch.where(logits < min_value, torch.full_like(logits, float('-inf')), logits)
+
     def forward(self, 
                 player_civ: torch.Tensor,
                 enemy_civ: torch.Tensor,
@@ -151,7 +248,9 @@ class BuildOrderGenerator(nn.Module):
                 target_win_prob: Optional[torch.Tensor] = None,
                 teacher_forcing_ratio: float = 0.5,
                 ground_truth: Optional[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = None,
-                allowed_entities_mask: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+                allowed_entities_mask: Optional[torch.Tensor] = None,
+                temperature: float = 1.0,
+                top_k: int = 0) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Generate build order or train with teacher forcing.
 
@@ -305,11 +404,20 @@ class BuildOrderGenerator(nn.Module):
                 allowed = allowed_entities_mask
 
             # Apply mask to entity logits for sampling only (not stored for loss)
-            entity_logits_masked = entity_logits
+            entity_logits_masked = entity_logits.clone()
+            # Mask special tokens: PAD (index 0) and UNK (index 1) should never be selected
+            entity_logits_masked[:, :, 0] = self.mask_value  # <PAD>
+            entity_logits_masked[:, :, 1] = self.mask_value  # <UNK>
+            
+            # Similarly mask special tokens for events
+            event_logits_masked = event_logits.clone()
+            event_logits_masked[:, :, 0] = self.mask_value  # <PAD>
+            event_logits_masked[:, :, 1] = self.mask_value  # <UNK>
+            
             if allowed is not None:
                 # allowed: (B, V) -> expand to (B, 1, V) to match logits
                 allowed_b1v = allowed.unsqueeze(1)
-                entity_logits_masked = entity_logits.masked_fill(~allowed_b1v, self.mask_value)
+                entity_logits_masked = entity_logits_masked.masked_fill(~allowed_b1v, self.mask_value)
             
             # Decide whether to use ground truth or predictions
             # Use teacher forcing when: ground truth is available AND random sample < teacher_forcing_ratio
@@ -321,10 +429,36 @@ class BuildOrderGenerator(nn.Module):
                 next_event = ground_truth[1][:, step:step+1]   # (B, 1)
                 next_time = ground_truth[2][:, step:step+1].unsqueeze(-1) if step > 0 else time_delta.unsqueeze(-1)
             else:
-                # Greedy sampling (can be changed to beam search/top-k during inference)
-                # Use masked logits for sampling so disallowed entities are not selected
-                next_entity = torch.argmax(entity_logits_masked, dim=-1)  # (B, 1)
-                next_event = torch.argmax(event_logits, dim=-1)    # (B, 1)
+                # Temperature-scaled sampling with optional top-k filtering
+                # This prevents mode collapse (always predicting Villager)
+                
+                # Apply temperature scaling
+                if temperature != 1.0:
+                    entity_logits_scaled = entity_logits_masked / max(temperature, 1e-8)
+                    event_logits_scaled = event_logits_masked / max(temperature, 1e-8)
+                else:
+                    entity_logits_scaled = entity_logits_masked
+                    event_logits_scaled = event_logits_masked
+                
+                # Apply top-k filtering if specified
+                if top_k > 0:
+                    entity_logits_scaled = self._top_k_filter(entity_logits_scaled, top_k)
+                    event_logits_scaled = self._top_k_filter(event_logits_scaled, top_k)
+                
+                # Sample from distribution instead of greedy argmax
+                entity_probs = F.softmax(entity_logits_scaled.squeeze(1), dim=-1)  # (B, V)
+                event_probs = F.softmax(event_logits_scaled.squeeze(1), dim=-1)    # (B, V)
+                
+                # Handle potential NaN/inf from temperature scaling
+                entity_probs = torch.nan_to_num(entity_probs, nan=0.0, posinf=0.0, neginf=0.0)
+                event_probs = torch.nan_to_num(event_probs, nan=0.0, posinf=0.0, neginf=0.0)
+                
+                # Ensure valid probability distributions
+                entity_probs = entity_probs / (entity_probs.sum(dim=-1, keepdim=True) + 1e-8)
+                event_probs = event_probs / (event_probs.sum(dim=-1, keepdim=True) + 1e-8)
+                
+                next_entity = torch.multinomial(entity_probs, 1)  # (B, 1)
+                next_event = torch.multinomial(event_probs, 1)    # (B, 1)
                 next_time = time_delta.unsqueeze(-1)  # (B, 1)
             
             # Embed the chosen tokens for next step
@@ -492,8 +626,12 @@ class BuildOrderTrainer:
     Can optionally use a pretrained win prediction model as a reward signal.
 
     Supports AMP (automatic mixed precision) and gradient accumulation to reduce memory usage.
+    Uses Focal Loss to address class imbalance (prevents model from always predicting Villager).
     """
-    def __init__(self, model, optimizer, device, use_reinforce=False, reward_model=None, use_amp: bool = False, grad_accum_steps: int = 1, label_smoothing: float = 0.1):
+    def __init__(self, model, optimizer, device, use_reinforce=False, reward_model=None, 
+                 use_amp: bool = False, grad_accum_steps: int = 1, label_smoothing: float = 0.1,
+                 use_focal_loss: bool = True, focal_gamma: float = 2.0,
+                 entity_class_weights: Optional[torch.Tensor] = None):
         self.model = model
         self.optimizer = optimizer
         self.device = device
@@ -529,32 +667,60 @@ class BuildOrderTrainer:
         
         # Label smoothing to prevent overconfidence on common classes like Villager
         self.label_smoothing = label_smoothing
+        
+        # Focal Loss configuration to address class imbalance
+        self.use_focal_loss = use_focal_loss
+        self.focal_gamma = focal_gamma
+        
+        # Initialize loss functions
+        if use_focal_loss:
+            print(f"Using Focal Loss with gamma={focal_gamma}, label_smoothing={label_smoothing}")
+            self.entity_loss_fn = FocalLoss(
+                alpha=entity_class_weights,
+                gamma=focal_gamma,
+                ignore_index=0,
+                label_smoothing=label_smoothing
+            )
+            self.event_loss_fn = FocalLoss(
+                alpha=None,  # Events are more balanced
+                gamma=focal_gamma,
+                ignore_index=0,
+                label_smoothing=label_smoothing
+            )
+        else:
+            self.entity_loss_fn = None
+            self.event_loss_fn = None
 
         
     def compute_loss(self, predictions, targets, win_probs, target_win_probs=None):
         """
         Compute combined loss for build order generation.
         
-        Note: CrossEntropyLoss with label_smoothing can have numerical issues under AMP autocast
-        with float16. We cast logits to float32 to ensure correct loss computation.
+        Uses Focal Loss for entity/event classification to address class imbalance.
+        This prevents the model from always predicting high-frequency entities like Villager.
+        
+        Note: Logits are cast to float32 to ensure correct loss computation under AMP.
         """
         entity_logits, event_logits, time_preds, pred_win_probs = predictions
         entity_targets, event_targets, time_targets = targets
         
-        # Classification losses for entity and event with optional label smoothing
-        # Label smoothing helps prevent overconfidence on frequent classes
-        # Cast logits to float32 to avoid numerical issues with label_smoothing under AMP
-        entity_loss = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=self.label_smoothing)(
-            entity_logits.view(-1, entity_logits.size(-1)).float(),
-            entity_targets.view(-1)
-        )
+        # Classification losses - use Focal Loss if enabled, otherwise CrossEntropy
+        if self.use_focal_loss and self.entity_loss_fn is not None:
+            # Focal Loss handles class imbalance by down-weighting easy/common examples
+            entity_loss = self.entity_loss_fn(entity_logits, entity_targets)
+            event_loss = self.event_loss_fn(event_logits, event_targets)
+        else:
+            # Fallback to standard CrossEntropyLoss with label smoothing
+            entity_loss = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=self.label_smoothing)(
+                entity_logits.view(-1, entity_logits.size(-1)).float(),
+                entity_targets.view(-1)
+            )
+            event_loss = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=self.label_smoothing)(
+                event_logits.view(-1, event_logits.size(-1)).float(),
+                event_targets.view(-1)
+            )
         
-        event_loss = nn.CrossEntropyLoss(ignore_index=0, label_smoothing=self.label_smoothing)(
-            event_logits.view(-1, event_logits.size(-1)).float(),
-            event_targets.view(-1)
-        )
-        
-        # Time prediction loss (MSE) - also cast to float32 for consistency
+        # Time prediction loss (MSE) - cast to float32 for consistency
         time_loss = nn.MSELoss()(time_preds.float(), time_targets.float())
         
         # Win probability prediction loss
@@ -566,9 +732,9 @@ class BuildOrderTrainer:
         # Combine losses
         total_loss = (
             entity_loss * 1.0 +
-            event_loss * 1.0 +
-            time_loss * 0.8 + 
-            win_loss * 0.5    
+            # event_loss * 1.0 +
+            #time_loss * 0.8 + 
+            win_loss * 0.3    
         )
         
         return total_loss, {
@@ -580,7 +746,11 @@ class BuildOrderTrainer:
         }
     
     def train_step(self, batch, teacher_forcing_ratio=0.5):
-        """Single training step. Supports AMP and gradient accumulation."""
+        """Single training step. Supports AMP and gradient accumulation.
+        
+        Note: Always uses autoregressive generation during training (never parallel mode)
+        to ensure the model learns to generate sequences without teacher forcing.
+        """
         self.model.train()
 
         # Unpack batch
@@ -603,6 +773,11 @@ class BuildOrderTrainer:
             allowed_entities_mask = None
 
         try:
+            # Force autoregressive mode during training by ensuring teacher_forcing_ratio < 1.0
+            # This prevents the model from relying on the parallel teacher-forcing path
+            # and ensures it learns proper autoregressive generation
+            training_tf_ratio = min(teacher_forcing_ratio, 0.999)  # Always < 1.0 during training
+            
             # Condition Dropout: with probability 0.2, mask the win condition (set to None)
             # to force the model to learn from the sequence itself rather than just the label.
             input_win_probs = target_win_probs
@@ -617,9 +792,11 @@ class BuildOrderTrainer:
                         enemy_civ=enemy_civ,
                         target_sequence_length=entity_ids.size(1),
                         target_win_prob=input_win_probs,
-                        teacher_forcing_ratio=teacher_forcing_ratio,
+                        teacher_forcing_ratio=training_tf_ratio,
                         ground_truth=(entity_ids, event_ids, times),
-                        allowed_entities_mask=allowed_entities_mask
+                        allowed_entities_mask=allowed_entities_mask,
+                        temperature=1.0,  # Use temperature sampling during training
+                        top_k=10  # Limit to top-10 choices during training
                     )
                     loss, loss_dict = self.compute_loss(
                         predictions,
@@ -640,9 +817,11 @@ class BuildOrderTrainer:
                     enemy_civ=enemy_civ,
                     target_sequence_length=entity_ids.size(1),
                     target_win_prob=input_win_probs,
-                    teacher_forcing_ratio=teacher_forcing_ratio,
+                    teacher_forcing_ratio=training_tf_ratio,
                     ground_truth=(entity_ids, event_ids, times),
-                    allowed_entities_mask=allowed_entities_mask
+                    allowed_entities_mask=allowed_entities_mask,
+                    temperature=1.0,  # Use temperature sampling during training
+                    top_k=10  # Limit to top-10 choices during training
                 )
                 loss, loss_dict = self.compute_loss(
                     predictions,

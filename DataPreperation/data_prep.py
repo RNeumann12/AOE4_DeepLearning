@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
 # Simple tool to compute per-civilization winrates from a .jsonl of collected game records.
+# Example Call:
+# python DataPreperation/data_prep.py collected_games_with_summary_v2_2026-01-21.jsonl
+# python DataPreperation/data_prep.py DataPreperation/2026-02-21_collected_games.jsonl --export-events 2026-02.csv
 import argparse
 import glob
 import json
