@@ -2,9 +2,9 @@
 Train BuildOrderGenerator from sequences using supervised teacher forcing.
 
 Usage:
-  python BuildOrderPrediction/BuildOrderPrediction_train.py --csv input_with_map.csv --epochs 50 --truncation_strategy head --max_len 128
+  python BuildOrderPrediction/BuildOrderPrediction_train.py --csv TrainingData/training_data_2026-01-21.csv --epochs 50 --truncation_strategy head --max_len 128
 python BuildOrderPrediction/BuildOrderPrediction_train.py \
-  --csv transformer_input_new.csv \
+  --csv TrainingData/training_data_2026-01-21.csv \
   --epochs 50 \
   --label_smoothing 0.2 \
   --truncation_strategy head \

@@ -3,10 +3,10 @@ Inference script: load saved model and run on dataset, printing / saving predict
 
 Usage examples:
 Standard inference over games to predict if player will win:
-    python WinRatePrediction/WinRate_infer.py --model best_model_len_200_no_destroy.pt --csv  TrainingData/training_data_2026-01-21.csv --max_len 200 --filter_destroy_events  --print_game_table
+    python WinRatePrediction/WinRate_infer.py --model WinRatePrediction/winrate_final_model.pt --csv  TrainingData/training_data_2026-01-21.csv --max_len 200 --filter_destroy_events  --print_game_table
 
 Sweep over sequence lengths to analyze accuracy vs length:
-    python WinRatePrediction/WinRate_infer.py --model best_model_len_200_no_destroy.pt --csv  TrainingData/training_data_2026-01-21.csv --sweep_lengths --max_len 200 --length_step 50 --filter_destroy_events
+    python WinRatePrediction/WinRate_infer.py --model WinRatePrediction/winrate_final_model.pt --csv  TrainingData/training_data_2026-01-21.csv --sweep_lengths --max_len 200 --length_step 50 --filter_destroy_events
 
 Validation on dataset:
   python WinRatePrediction/WinRate_infer.py --model WinRatePrediction/winrate_final_model.pt --csv TrainingData/training_data_2026-01-21.csv --max_len 100 --filter_destroy_events

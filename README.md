@@ -34,12 +34,9 @@ This README summarizes the project structure, core files, model design choices, 
 - Output: binary win/loss probability.
 - Notes: Designed to run on truncated early-game windows (e.g., `--max_len 50`) to evaluate early indicators.
 
-Example: analyze indicators with
+Example: Generate winrate prediction for dataset
 ```bash
-python WinRatePrediction/analyze_win_indicators.py \
-	--model best_model_len_50_no_destroy.pt \
-	--csv transformer_input_new.csv \
-	--max_len 50
+       python WinRatePrediction/WinRate_infer.py --model WinRatePrediction/winrate_final_model.pt --csv  TrainingData/training_data_2026-01-21.csv --max_len 200 --filter_destroy_events  --print_game_table
 ```
 
 **2) Build Order Prediction**
@@ -55,12 +52,11 @@ python WinRatePrediction/analyze_win_indicators.py \
 Quick training example:
 ```bash
 python BuildOrderPrediction/BuildOrderPrediction_train.py \
-	--csv transformer_input_new.csv \
-	--epochs 50 \
-	--truncation_strategy head \
-	--max_len 256 \
-	--use_focal_loss \
-	--label_smoothing 0.2
+  --csv TrainingData/training_data_2026-01-21.csv \
+  --epochs 50 \
+  --label_smoothing 0.2 \
+  --truncation_strategy head \
+  --max_len 256
 ```
 
 **3) Data Mining & Processing**
@@ -90,8 +86,8 @@ Notes:
 
 **Conventions & gotchas**
 
-- Checkpoints: model files are commonly named `best_*.pt` or `*.pth` (inconsistent extensions exist in the repo).
-- Filtering during vocabulary build (e.g., `DESTROY`) is applied only at training-data creation; inference mapping of unseen events goes to `UNK_TOKEN`.
+- Checkpoints: model files are commonly named `final_*.pt` or `*.pth` (inconsistent extensions exist in the repo).
+- Filtering during vocabulary build (e.g., `DESTROY`) is applied only at training-data creation;
 - Class imbalance: use focal loss (`--use_focal_loss`) and label smoothing to avoid degenerate predictions (e.g., always predicting Villager).
 - Train/validation split: done at the per-game level to preserve game integrity (no random sampling of events across games).
 
@@ -128,10 +124,6 @@ python BuildOrderPrediction/BuildOrderPrediction_train.py --csv transformer_inpu
 - Add standardized saving/loading for vocab artifacts used in inference.
 - Add example notebooks demonstrating embedding visualization and cluster interpretation.
 - Better unify checkpoint naming and add a small `scripts/` helper for common runs.
-
-If you'd like, I can:
-- run tests or training smoke-runs, or
-- add a short usage notebook demonstrating a complete preprocess → train → infer loop.
 
 ---
 
