@@ -11,11 +11,11 @@ Example:
   python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ English --enemy_civ French --map "Four Lakes" --build_steps 30 --greedy
   python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ French --enemy_civ French --map "Four Lakes" --build_steps 30 --greedy
   python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ abbasid_dynasty --enemy_civ English --map "Dry Arabia" --build_steps 30 --greedy
-  python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ English --enemy_civ French --map "Dry Arabia" --build_steps 30 --greedy --lora_checkpoint BuildOrderPrediction/lora_patch_15.3.8338.pth
-     
-python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ sengoku_daimyo --enemy_civ French --map "Dry Arabia" --build_steps 30 --greedy --lora_checkpoint BuildOrderPrediction/lora_patch_15.3.8338.pth
-python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ knights_templar --enemy_civ French --map "Dry Arabia" --build_steps 30 --greedy --lora_checkpoint BuildOrderPrediction/lora_patch_15.3.8338.pth
-python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ knights_templar --enemy_civ French --map "Dry Arabia" --build_steps 50 --lora_checkpoint BuildOrderPrediction/lora_patch_15.3.8338.pth
+
+With LoRA adapter (patch 15.3.8338):    
+    python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ sengoku_daimyo --enemy_civ French --map "Dry Arabia" --build_steps 30 --greedy --lora_checkpoint BuildOrderPrediction/lora_patch_15.3.8338.pth
+    python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ knights_templar --enemy_civ French --map "Dry Arabia" --build_steps 30 --greedy --lora_checkpoint BuildOrderPrediction/lora_patch_15.3.8338.pth
+    python BuildOrderPrediction/MoE_WithDecoder_infer.py --checkpoint BuildOrderPrediction/MoE_WithDecoder_best_model.pth --player_civ knights_templar --enemy_civ French --map "Dry Arabia" --build_steps 50 --lora_checkpoint BuildOrderPrediction/lora_patch_15.3.8338.pth
        """
 import os
 import sys
