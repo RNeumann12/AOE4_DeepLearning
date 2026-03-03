@@ -209,3 +209,10 @@ __marimo__/
 
 # WandB
 wandb/
+
+# Model checkpoints/files too large for GitHub LFS (>2GB limit)
+checkpoint_epoch_*.pth
+best_model.pth
+final_model.pth
+BuildOrderPrediction/MoE_WithDecoder_best_model.pth
+wandb/
