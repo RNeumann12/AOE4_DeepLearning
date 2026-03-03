@@ -1,0 +1,422 @@
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from sklearn.model_selection import train_test_split
+from dataset_event_based import AoE4Dataset
+from model_v2 import StrategyGRU
+from sklearn.metrics import (
+    precision_recall_fscore_support, 
+    confusion_matrix
+)
+from sklearn.metrics import ConfusionMatrixDisplay
+from sklearn.metrics import precision_recall_fscore_support
+from torch.optim.lr_scheduler import ReduceLROnPlateau
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+import numpy as np
+import wandb
+
+BATCH_SIZE = 32
+TEST_SIZE = 0.2
+NUM_EPOCHS = 30
+LR = 0.001
+PATIENCE = 5
+WEIGHT_DECAY = 0.001
+OPTIMIZER = 'adamw'
+LOSS_FUNCTION = 'weighted_cross_entropy'
+USE_SCHEDULER = False
+MOMENTUM = None
+
+def train_epoch(model, dataloader, criterion, optimizer, class_weights, device):
+    model.train()
+    train_loss = 0
+    train_correct = 0
+    train_total = 0
+    
+    all_predictions = []
+    all_labels = []
+    pbar = tqdm(dataloader, desc="Epoch {epoch}Training", leave=False)
+    for batch in pbar:
+        sequence = batch['sequence'].to(device)
+        mask = batch['mask'].to(device)
+        metadata = batch['metadata'].to(device)
+        labels = batch['label'].to(device)
+        
+        optimizer.zero_grad()
+        outputs = model(sequence, mask, metadata)
+        loss = criterion(outputs, labels)
+        loss.backward()
+        optimizer.step()
+        
+        train_loss += loss.item()
+        _, predicted = outputs.max(1)
+        train_total += labels.size(0)
+        train_correct += predicted.eq(labels).sum().item()
+
+        all_predictions.extend(predicted.cpu().numpy())
+        all_labels.extend(labels.cpu().numpy())
+    
+    train_acc = 100. * train_correct / train_total 
+    weighted_acc = np.sum([class_weights[y]* (y == y_hat) for y, y_hat in zip(all_labels, all_predictions)]) / np.sum([class_weights[y] for y in all_labels])
+    
+    avg_train_loss = train_loss / len(dataloader)
+
+    return weighted_acc, avg_train_loss
+
+@torch.no_grad()
+def eval_epoch(model, dataloader, criterion, class_weights, device):
+    model.eval()
+    val_loss = 0
+    val_correct = 0
+    val_total = 0
+
+    all_predictions = []
+    all_labels = []
+    all_confidences = []
+    false_classified_info = []
+    
+    with torch.no_grad():
+        for batch in dataloader:
+            sequence = batch['sequence'].to(device)
+            mask = batch['mask'].to(device)
+            metadata = batch['metadata'].to(device)
+            labels = batch['label'].to(device)
+            
+            outputs = model(sequence, mask, metadata)
+            loss = criterion(outputs, labels)
+
+            # probabilities
+            probs = torch.softmax(outputs, dim=1)
+            confidences, predicted = probs.max(1)
+
+            # calc loss
+            val_loss += loss.item()
+            _, predicted = outputs.max(1)
+            val_total += labels.size(0)
+            val_correct += predicted.eq(labels).sum().item()
+
+            # Store for metrics
+            all_predictions.extend(predicted.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+            all_confidences.extend(confidences.cpu().numpy())
+
+            # Track false classifications
+            for i in range(len(labels)):
+                if predicted[i] != labels[i]:
+                    false_classified_info.append({
+                        'true_label': labels[i].item(),
+                        'predicted_label': predicted[i].item(),
+                        'confidence': confidences[i].item(),
+                        'all_probs': probs[i].cpu().numpy()
+                    })
+    
+    weighted_acc = np.sum([class_weights[y]* (y == y_hat) for y, y_hat in zip(all_labels, all_predictions)]) / np.sum([class_weights[y] for y in all_labels])
+    
+    val_acc = 100. * val_correct / val_total
+    avg_val_loss = val_loss / len(dataloader)
+
+    # Calculate metrics
+    all_predictions = np.array(all_predictions)
+    all_labels = np.array(all_labels)
+
+    precision, recall, f1, _ = precision_recall_fscore_support(
+        all_labels, all_predictions, average=None, zero_division=0
+    )
+
+    weighted_precision, weighted_recall, weighted_f1, _ = precision_recall_fscore_support(
+        all_labels, 
+        all_predictions, 
+        average='weighted'
+    )
+
+    print(f"Weighted Precision: {weighted_precision:.4f}")
+    print(f"Weighted Recall: {weighted_recall:.4f}")
+    print(f"Weighted F1-Score: {weighted_f1:.4f}")
+    
+    # Confusion matrix
+    cm = confusion_matrix(all_labels, all_predictions)
+    
+    # Per-class TP, FP, TN, FN and rates
+    num_classes = cm.shape[0]
+    class_metrics = []
+    
+    for i in range(num_classes):
+        tp = cm[i, i]
+        fp = cm[:, i].sum() - tp
+        fn = cm[i, :].sum() - tp
+        tn = cm.sum() - tp - fp - fn
+        
+        total = tp + fp + tn + fn
+        tp_rate = tp / (tp + fn) if (tp + fn) > 0 else 0  # Same as recall
+        fp_rate = fp / (fp + tn) if (fp + tn) > 0 else 0
+        tn_rate = tn / (tn + fp) if (tn + fp) > 0 else 0  # Specificity
+        fn_rate = fn / (fn + tp) if (fn + tp) > 0 else 0
+        
+        class_metrics.append({
+            'class': i,
+            'tp': tp, 
+            'fp': fp, 
+            'tn': tn, 
+            'fn': fn,
+            'tp_rate': tp_rate,
+            'fp_rate': fp_rate,
+            'tn_rate': tn_rate,
+            'fn_rate': fn_rate,
+            'precision': precision[i],
+            'recall': recall[i],
+            'f1': f1[i]
+        })
+    
+    metrics = {
+        'accuracy': val_acc,
+        'weighted_accuracy': weighted_acc,
+        'loss': avg_val_loss,
+        'class_metrics': class_metrics,
+        'confusion_matrix': cm,
+        'false_classified': false_classified_info,
+        'weighted_precision': precision,
+        'weighted_recall': recall,
+        'weighted_f1': f1,
+    }
+    
+    return metrics
+
+
+def log_metrics_to_wandb(metrics, label_names, epoch, phase='val'):
+    """Log all metrics to wandb"""
+    
+    # Collect all metrics in one dict
+    log_dict = {
+        f"{phase}/accuracy": metrics['accuracy'],
+        f"{phase}/weighted_accuracy": metrics['weighted_accuracy'],
+        f"{phase}/weighted_precision": metrics['weighted_precision'],
+        f"{phase}/weighted_recall": metrics['weighted_recall'],
+        f"{phase}/weighted_f1": metrics['weighted_f1'],
+        f"{phase}/loss": metrics['loss']
+    }
+    
+    # Per-class metrics
+    for cm in metrics['class_metrics']:
+        class_name = label_names[cm['class']] if label_names else f"class_{cm['class']}"
+        log_dict.update({
+            f"{phase}/{class_name}/precision": cm['precision'],
+            f"{phase}/{class_name}/recall": cm['recall'],
+            f"{phase}/{class_name}/f1": cm['f1'],
+            f"{phase}/{class_name}/tp": cm['tp'],
+            f"{phase}/{class_name}/fp": cm['fp'],
+            f"{phase}/{class_name}/tn": cm['tn'],
+            f"{phase}/{class_name}/fn": cm['fn'],
+            f"{phase}/{class_name}/tp_rate": cm['tp_rate'],
+            f"{phase}/{class_name}/fp_rate": cm['fp_rate'],
+            f"{phase}/{class_name}/tn_rate": cm['tn_rate'],
+            f"{phase}/{class_name}/fn_rate": cm['fn_rate'],
+        })
+    
+    # Confusion matrix
+    cm = metrics['confusion_matrix']
+    fig, ax = plt.subplots(figsize=(10, 8))
+    
+    if label_names:
+        display_labels = [label_names[i] for i in range(len(label_names))]
+    else:
+        display_labels = [f"Class {i}" for i in range(len(cm))]
+    
+    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=display_labels)
+    disp.plot(ax=ax, cmap='Blues', values_format='d')
+    plt.title(f'{phase.capitalize()} Confusion Matrix - Epoch {epoch}')
+    plt.tight_layout()
+    
+    log_dict[f"{phase}/confusion_matrix"] = wandb.Image(fig)
+    plt.close(fig)
+    
+    # False classifications
+    log_dict[f"{phase}/false_classifications_count"] = len(metrics['false_classified'])
+    
+    if len(metrics['false_classified']) > 0:
+        false_confidences = [fc['confidence'] for fc in metrics['false_classified']]
+        log_dict.update({
+            f"{phase}/false_classifications_avg_confidence": np.mean(false_confidences),
+            f"{phase}/false_classifications_min_confidence": np.min(false_confidences),
+            f"{phase}/false_classifications_max_confidence": np.max(false_confidences),
+        })
+
+    return log_dict
+
+def print_label_distribution(y, name="Dataset"):
+    unique_classes, counts = np.unique(y, return_counts=True)
+    total = len(y)
+    print(f"{name} label distribution:")
+    for cls, count in zip(unique_classes, counts):
+        print(f"Class {cls:<3}: {count:>5} ({count/total*100:5.2f}%)")
+
+
+def main():
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    torch.cuda.empty_cache()
+    if hasattr(torch.cuda, 'reset_peak_memory_stats'):
+        torch.cuda.reset_peak_memory_stats()
+
+    wandb.init(
+        project="DeepLearning-StrategieDiscoverySupervisedEventBased",
+        config={
+            "batch_size": BATCH_SIZE,
+            "epochs": NUM_EPOCHS,
+            "lr": LR,
+            "patience": PATIENCE,
+            "weight_decay": WEIGHT_DECAY,
+            "optimizer": OPTIMIZER,
+            "use_scheduler": USE_SCHEDULER,
+            "momentum": MOMENTUM,
+        }
+    )
+
+    # Load dataset
+    data = np.load('./StrategyDiscovery/SupervisedEventBased/aoe4_dataset_final.npz', allow_pickle=True)
+    X_seq = data['X_seq']
+    X_mask = data['X_mask']
+    X_meta = data['X_meta']
+    y = data['y']
+
+    # Load vocabularies
+    entity_vocab = data['entity_vocab'].item()
+    event_vocab = data['event_vocab'].item()
+    type_vocab = data['type_vocab'].item()
+    age_vocab = data['age_vocab'].item()
+    civ_vocab = data['civ_vocab'].item()
+    enemy_civ_vocab = data['enemy_civ_vocab'].item()
+    map_vocab = data['map_vocab'].item()
+    label_vocab = data['label_vocab'].item()
+    
+    label_names = {v: k for k, v in label_vocab.items()}  # Reverse mapping
+
+    # Train/val split
+    X_seq_train, X_seq_val, X_mask_train, X_mask_val, X_meta_train, X_meta_val, y_train, y_val = train_test_split(
+        X_seq, X_mask, X_meta, y, test_size=TEST_SIZE, random_state=42, stratify=y        
+    )
+
+    idx_to_strat = {v: k for k, v in label_vocab.items()}
+    unique_classes, class_counts = np.unique(y, return_counts=True)
+
+    for class_id, count in zip(unique_classes, class_counts):
+        class_name = idx_to_strat[class_id]
+        percentage = (count / len(y)) * 100
+        print(f"{class_name:<30} {class_id:<12} {count:<12} {percentage:>10.1f}%")
+
+    # class_weights = torch.FloatTensor(weights).to(device)
+    class_weights = {cls: 1/count for cls, count in zip(unique_classes, class_counts)}
+    print(f"\nClass weights for accuracy calculation:")
+    print(f"{'Strategy Name':<30} {'Weight':<15}")
+    print("=" * 45)
+    for class_id in range(len(label_vocab)):
+        class_name = idx_to_strat[class_id]
+        print(f"{class_name:<30} {class_weights[class_id]:.4f}")
+    
+    # Create datasets and dataloaders
+    train_dataset = AoE4Dataset(X_seq_train, X_mask_train, X_meta_train, y_train)
+    val_dataset = AoE4Dataset(X_seq_val, X_mask_val, X_meta_val, y_val)
+
+    print(f"\nTraining samples: {len(train_dataset)}")
+    print_label_distribution(y_train, "Train")
+
+    print(f"\nValidation samples: {len(val_dataset)}")
+    print_label_distribution(y_val, "Validation")
+
+    # sampler = WeightedRandomSampler(class_weights , num_samples=len(class_weights ), replacement=True)
+    train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+    val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False)
+
+    # Initialize model
+    vocab_sizes = {
+        'entity': len(entity_vocab) + 1,
+        'event': len(event_vocab) + 1,
+        'type': len(type_vocab) +1,
+        'age': len(age_vocab) + 1,
+        'civ': len(civ_vocab) + 1,
+        'enemy_civ': len(enemy_civ_vocab) + 1,
+        'map': len(map_vocab) + 1
+    }
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model = StrategyGRU(vocab_sizes, num_classes=len(label_vocab)).to(device)
+
+    if LOSS_FUNCTION == 'weighted_cross_entropy':  
+        ordered_weights = [class_weights[i] for i in range(len(class_weights))]
+        class_weights_tensor = torch.FloatTensor(ordered_weights).to(device)
+        criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
+    elif LOSS_FUNCTION == 'cross_entropy':
+        criterion = nn.CrossEntropyLoss()
+
+    patience = PATIENCE
+    optimizer = None
+    scheduler = None
+
+    if OPTIMIZER == 'adamw':
+        optimizer = optim.AdamW(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    elif OPTIMIZER == 'sgd':
+        # optimizer = optim.SGD(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY, momentum=MOMENTUM)
+        optimizer = optim.SGD(model.parameters(), lr=LR, momentum=MOMENTUM)
+        if USE_SCHEDULER:
+            scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=PATIENCE)
+
+    # Training settings
+    best_val_acc = -1
+    patience_counter = 0
+
+    # Training loop
+    for epoch in range(NUM_EPOCHS):
+        # Train
+        train_acc, avg_train_loss = train_epoch(model, train_loader, criterion, optimizer, class_weights, device)
+    
+        # Validation
+        val_metrics = eval_epoch(model, val_loader, criterion, class_weights, device)
+        val_loss = val_metrics['loss']
+        val_acc = val_metrics['weighted_accuracy']
+            
+        print(f'Epoch {epoch+1}/{NUM_EPOCHS}:')
+        print(f' Train Loss: {avg_train_loss:.4f}, Train Acc: {train_acc:.2f}%')
+        print(f' Val Loss: {val_loss:.4f}, Val Acc: {val_acc:.2f}%')
+
+        # Log to wandb
+        log_dict = log_metrics_to_wandb(val_metrics, label_names, epoch, phase='val')
+        wandb.log(log_dict | {
+            "Train Loss": avg_train_loss,
+            "Train Accuracy": train_acc,
+            "Validation Loss": val_loss,
+            "Validation Accuracy": val_acc,
+            "Epoch": epoch
+        }, step=epoch)
+        
+        if scheduler is None:
+            if val_acc > best_val_acc + 1e-3:
+                best_val_acc = val_acc
+                best_model_state = model.state_dict()
+                torch.save(best_model_state, 'best_strat_disc_event_based.pt')
+                print(f'  → Model saved! (Val Acc: {val_acc:.2f}%)')
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                print(f"  ✗ No improvement. Patience: {patience_counter}/{patience}")
+                
+                if patience_counter >= patience:
+                    print(f"\n🛑 Early stopping triggered at epoch {epoch}")
+                    print(f"Best validation accuracy was: {best_val_acc:.4f}")
+                    model.load_state_dict(best_model_state)
+                    break
+        else: 
+            scheduler.step(val_loss)
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                best_model_state = model.state_dict()
+                torch.save(best_model_state, 'best_strat_disc_event_based.pt')
+                print(f'  → Model saved! (Val Acc: {val_acc:.2f}%)')
+
+    print(f'\nTraining complete! Best validation accuracy: {best_val_acc:.2f}%')
+    
+    torch.save(model.state_dict(), 'best_strat_disc_event_based.pt')
+    wandb.save('best_strat_disc_event_based.pt')
+
+
+if __name__ == "__main__":
+    main()
